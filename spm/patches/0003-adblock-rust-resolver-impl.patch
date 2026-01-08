@@ -1,0 +1,23 @@
+--- a/Sources/BraveAdblockRust/src/lib.rs
++++ b/Sources/BraveAdblockRust/src/lib.rs
+@@ -118,20 +118,6 @@
+         fn convert_rules_to_content_blocking(rules: &CxxString) -> ContentBlockingRulesResult;
+     }
+ 
+-    unsafe extern "C++" {
+-        include!("brave/components/brave_shields/core/browser/adblock/resolver/adblock_domain_resolver.h");
+-
+-        /// Wrapper function for
+-        /// net::registry_controlled_domains::GetDomainAndRegistry
+-        /// implemented in Chromium.
+-        fn resolve_domain_position(host: &CxxString) -> DomainPosition;
+-    }
+-
+-    struct DomainPosition {
+-        start: u32,
+-        end: u32,
+-    }
+-
+     #[derive(Default)]
+     struct BlockerResult {
+         matched: bool,

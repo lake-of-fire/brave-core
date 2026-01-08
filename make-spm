@@ -1,0 +1,6 @@
+#!/usr/bin/env python3
+"""Generate the swift-brave SPM package from brave-core sources."""
+from spm.make_spm import main
+
+if __name__ == "__main__":
+    raise SystemExit(main())

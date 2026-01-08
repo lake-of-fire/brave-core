@@ -77,6 +77,7 @@ venv/
 test_get_pkgs
 build/config/gclient_args.gni
 third_party/rust/target
+tools/crates/vendor/cxxbridge-cmd/target
 xcuserdata
 
 # This is a temp file used by script/version_up.py

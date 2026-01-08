@@ -1,0 +1,10 @@
+--- a/Sources/BraveAdblockRust/src/engine.rs
++++ b/Sources/BraveAdblockRust/src/engine.rs
+@@ -89,6 +89,6 @@
+         let mut filter_set = InnerFilterSet::new(true);
+         filter_set.add_filter_list(
+             rules.to_str()?,
+-            ParseOptions { rule_types: RuleTypes::NetworkOnly, ..Default::default() },
++            ParseOptions { rule_types: RuleTypes::All, ..Default::default() },
+         );
+ 

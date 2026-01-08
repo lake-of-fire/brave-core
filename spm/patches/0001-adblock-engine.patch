@@ -1,0 +1,191 @@
+--- a/Sources/BraveAdblockCore/src/AdblockEngine.mm
++++ b/Sources/BraveAdblockCore/src/AdblockEngine.mm
+@@ -3,16 +3,52 @@
+  * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+  * You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+-#include "brave/ios/browser/api/brave_shields/adblock_engine.h"
++#include "AdblockEngine.h"
+ 
+-#include "base/strings/sys_string_conversions.h"
+-#include "brave/base/apple/foundation_util.h"
+-#include "brave/components/brave_shields/core/browser/adblock/rs/src/lib.rs.h"
++#include <string>
++#include <vector>
+ 
++#include "adblock/lib.rs.h"
++
+ #if !defined(__has_feature) || !__has_feature(objc_arc)
+ #error "This file requires ARC support."
+ #endif
+ 
++namespace brave_adblock {
++static std::string SysNSStringToUTF8(NSString* string) {
++  if (string == nil) {
++    return std::string();
++  }
++  const char* utf8 = [string UTF8String];
++  if (utf8 == nullptr) {
++    return std::string();
++  }
++  return std::string(utf8);
++}
++
++static NSString* SysUTF8ToNSString(const std::string& string) {
++  if (string.empty()) {
++    return @"";
++  }
++  NSString* value = [[NSString alloc] initWithBytes:string.data()
++                                             length:string.size()
++                                           encoding:NSUTF8StringEncoding];
++  return value ?: @"";
++}
++
++static std::vector<std::string> NSStringArrayToVector(NSArray<NSString*>* array) {
++  std::vector<std::string> vector;
++  if (array == nil) {
++    return vector;
++  }
++  vector.reserve(array.count);
++  for (NSString* value in array) {
++    vector.emplace_back(SysNSStringToUTF8(value));
++  }
++  return vector;
++}
++}  // namespace brave_adblock
++
+ @interface AdblockEngineMatchResult ()
+ @property(nonatomic, readwrite) bool didMatchRule;
+ @property(nonatomic, readwrite) bool didMatchException;
+@@ -125,7 +161,8 @@
+                  code:static_cast<NSInteger>(kind)
+              userInfo:@{
+                NSLocalizedDescriptionKey :
+-                   base::SysUTF8ToNSString(static_cast<std::string>(message))
++                   brave_adblock::SysUTF8ToNSString(
++                       static_cast<std::string>(message))
+              }];
+ }
+ 
+@@ -151,20 +188,22 @@
+                   previouslyMatchedRule:(bool)previouslyMatchedRule
+                    forceCheckExceptions:(bool)forceCheckExceptions {
+   auto engine_result = adblock_engine->matches(
+-      base::SysNSStringToUTF8(url), base::SysNSStringToUTF8(host),
+-      base::SysNSStringToUTF8(tabHost), base::SysNSStringToUTF8(resourceType),
++      brave_adblock::SysNSStringToUTF8(url),
++      brave_adblock::SysNSStringToUTF8(host),
++      brave_adblock::SysNSStringToUTF8(tabHost),
++      brave_adblock::SysNSStringToUTF8(resourceType),
+       isThirdParty, previouslyMatchedRule, forceCheckExceptions);
+   auto result = [[AdblockEngineMatchResult alloc] init];
+   result.didMatchRule = engine_result.matched;
+   result.didMatchException = engine_result.has_exception;
+   result.didMatchImportant = engine_result.important;
+   if (engine_result.redirect.has_value) {
+-    result.redirect = base::SysUTF8ToNSString(
++    result.redirect = brave_adblock::SysUTF8ToNSString(
+         static_cast<std::string>(engine_result.redirect.value));
+   }
+   if (engine_result.rewritten_url.has_value) {
+     ;
+-    result.rewrittenURL = base::SysUTF8ToNSString(
++    result.rewrittenURL = brave_adblock::SysUTF8ToNSString(
+         static_cast<std::string>(engine_result.rewritten_url.value));
+   }
+   return result;
+@@ -175,11 +214,12 @@
+                          tabHost:(NSString*)tabHost
+                     isThirdParty:(bool)isThirdParty
+                     resourceType:(NSString*)resourceType {
+-  return base::SysUTF8ToNSString(
++  return brave_adblock::SysUTF8ToNSString(
+       static_cast<std::string>(adblock_engine->get_csp_directives(
+-          base::SysNSStringToUTF8(url), base::SysNSStringToUTF8(host),
+-          base::SysNSStringToUTF8(tabHost),
+-          base::SysNSStringToUTF8(resourceType), isThirdParty)));
++          brave_adblock::SysNSStringToUTF8(url),
++          brave_adblock::SysNSStringToUTF8(host),
++          brave_adblock::SysNSStringToUTF8(tabHost),
++          brave_adblock::SysNSStringToUTF8(resourceType), isThirdParty)));
+ }
+ 
+ - (bool)deserialize:(NSData*)data {
+@@ -204,29 +244,30 @@
+ }
+ 
+ - (void)addTag:(NSString*)tag {
+-  adblock_engine->enable_tag(base::SysNSStringToUTF8(tag));
++  adblock_engine->enable_tag(brave_adblock::SysNSStringToUTF8(tag));
+ }
+ 
+ - (void)removeTag:(NSString*)tag {
+-  adblock_engine->disable_tag(base::SysNSStringToUTF8(tag));
++  adblock_engine->disable_tag(brave_adblock::SysNSStringToUTF8(tag));
+ }
+ 
+ - (bool)tagExists:(NSString*)tag {
+-  return adblock_engine->tag_exists(base::SysNSStringToUTF8(tag));
++  return adblock_engine->tag_exists(brave_adblock::SysNSStringToUTF8(tag));
+ }
+ 
+ - (bool)useResources:(NSString*)resources {
+   // TODO(https://github.com/brave/brave-browser/issues/51103):
+   // Reuse the once created storage for the both engines.
+   auto storage =
+-      adblock::new_resource_storage(base::SysNSStringToUTF8(resources));
++      adblock::new_resource_storage(brave_adblock::SysNSStringToUTF8(resources));
+   adblock_engine->use_resource_storage(*storage);
+   return true;
+ }
+ 
+ - (NSString*)cosmeticResourcesForURL:(NSString*)url {
+-  return base::SysUTF8ToNSString(static_cast<std::string>(
+-      adblock_engine->url_cosmetic_resources(base::SysNSStringToUTF8(url))));
++  return brave_adblock::SysUTF8ToNSString(static_cast<std::string>(
++      adblock_engine->url_cosmetic_resources(
++          brave_adblock::SysNSStringToUTF8(url))));
+ }
+ 
+ - (nullable NSArray<NSString*>*)
+@@ -235,9 +276,9 @@
+                                     exceptions:(NSArray<NSString*>*)exceptions
+                                          error:(NSError**)error {
+   const auto result = adblock_engine->hidden_class_id_selectors(
+-      brave::ns_to_vector<std::string>(classes),
+-      brave::ns_to_vector<std::string>(ids),
+-      brave::ns_to_vector<std::string>(exceptions));
++      brave_adblock::NSStringArrayToVector(classes),
++      brave_adblock::NSStringArrayToVector(ids),
++      brave_adblock::NSStringArrayToVector(exceptions));
+   if (result.result_kind != adblock::ResultKind::Success) {
+     if (error) {
+       *error = [[self class] adblockErrorForKind:result.result_kind
+@@ -248,7 +289,8 @@
+   auto selectors = [[NSMutableArray<NSString*> alloc] init];
+   for (auto selector : result.value) {
+     [selectors
+-        addObject:base::SysUTF8ToNSString(static_cast<std::string>(selector))];
++        addObject:brave_adblock::SysUTF8ToNSString(
++                              static_cast<std::string>(selector))];
+   }
+   return [selectors copy];
+ }
+@@ -261,7 +303,7 @@
+     contentBlockerRulesFromFilterSet:(NSString*)filterSet
+                                error:(NSError**)error {
+   auto result = adblock::convert_rules_to_content_blocking(
+-      base::SysNSStringToUTF8(filterSet));
++      brave_adblock::SysNSStringToUTF8(filterSet));
+   if (result.result_kind != adblock::ResultKind::Success) {
+     if (error) {
+       *error = [self adblockErrorForKind:result.result_kind
+@@ -270,7 +312,7 @@
+     return nil;
+   }
+   auto value = [[ContentBlockingRulesResult alloc] init];
+-  value.rulesJSON = base::SysUTF8ToNSString(
++  value.rulesJSON = brave_adblock::SysUTF8ToNSString(
+       static_cast<std::string>(result.value.rules_json));
+   value.truncated = result.value.truncated;
+   return value;
