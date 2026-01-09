@@ -185,6 +185,9 @@ def configure_rust_release_profile(dest: Path):
     updated_content = content
     updated_content = ensure_setting(updated_content, "lto", '"thin"')
     updated_content = ensure_setting(updated_content, "codegen-units", "1")
+    updated_content = ensure_setting(updated_content, "opt-level", '"z"')
+    updated_content = ensure_setting(updated_content, "panic", '"abort"')
+    updated_content = ensure_setting(updated_content, "strip", '"symbols"')
 
     if match:
         updated = prefix + "[profile.release]" + updated_content + suffix
