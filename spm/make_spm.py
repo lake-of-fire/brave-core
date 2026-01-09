@@ -164,7 +164,7 @@ def configure_rust_release_profile(dest: Path):
         raise SystemExit(f"Missing Cargo.toml at {cargo_toml}")
 
     text = cargo_toml.read_text()
-    match = re.search(r"(?s)\\[profile\\.release\\](.*?)(\\n\\[|\\Z)", text)
+    match = re.search(r"\[profile\.release\](.*?)(\n\[|$)", text, re.DOTALL)
     if match:
         block = match.group(0)
         content = match.group(1)
