@@ -2,6 +2,7 @@ import argparse
 import errno
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -157,6 +158,43 @@ def normalize_rust_features(dest: Path):
     cargo_toml.write_text(updated)
 
 
+def configure_rust_release_profile(dest: Path):
+    cargo_toml = dest / "Sources" / "BraveAdblockRust" / "Cargo.toml"
+    if not cargo_toml.exists():
+        raise SystemExit(f"Missing Cargo.toml at {cargo_toml}")
+
+    text = cargo_toml.read_text()
+    match = re.search(r"(?s)\\[profile\\.release\\](.*?)(\\n\\[|\\Z)", text)
+    if match:
+        block = match.group(0)
+        content = match.group(1)
+        block_end = match.end(1)
+        prefix = text[: match.start(0)]
+        suffix = text[block_end:]
+    else:
+        prefix = text.rstrip() + "\n\n[profile.release]\n"
+        content = ""
+        suffix = "\n"
+
+    def ensure_setting(block_text: str, key: str, value: str) -> str:
+        pattern = re.compile(rf"^{re.escape(key)}\\s*=.*$", re.MULTILINE)
+        if pattern.search(block_text):
+            return pattern.sub(f"{key} = {value}", block_text, count=1)
+        return block_text.rstrip() + f"\n{key} = {value}\n"
+
+    updated_content = content
+    updated_content = ensure_setting(updated_content, "lto", '"thin"')
+    updated_content = ensure_setting(updated_content, "codegen-units", "1")
+
+    if match:
+        updated = prefix + "[profile.release]" + updated_content + suffix
+    else:
+        updated = prefix + updated_content + suffix
+
+    if updated != text:
+        cargo_toml.write_text(updated)
+
+
 def xcrun_sdk_path(sdk: str) -> str:
     return subprocess.check_output(["xcrun", "--sdk", sdk, "--show-sdk-path"], text=True).strip()
 
@@ -177,6 +215,9 @@ def rust_env_for_sdk(sdk: str, min_version: str) -> dict:
         env["IPHONEOS_DEPLOYMENT_TARGET"] = min_version
     else:
         env["MACOSX_DEPLOYMENT_TARGET"] = min_version
+    rustflags = env.get("RUSTFLAGS", "")
+    extra_flags = "-C link-arg=-dead_strip"
+    env["RUSTFLAGS"] = f"{rustflags} {extra_flags}".strip()
     return env
 
 
@@ -464,6 +505,7 @@ def main() -> int:
     copy_sources(dest)
     apply_patches(dest)
     normalize_rust_features(dest)
+    configure_rust_release_profile(dest)
 
     if not args.skip_build:
         build_xcframework(dest)
