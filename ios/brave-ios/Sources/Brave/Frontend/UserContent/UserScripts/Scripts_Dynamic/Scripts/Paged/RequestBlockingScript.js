@@ -8,6 +8,20 @@
 window.__firefox__.execute(function($) {
   const messageHandler = '$<message_handler>';
   const blockingCache = new Map();
+  const shouldBypassBlocking = $((resourceURL) => {
+    const pageProtocol = window.location.protocol;
+    const resourceProtocol = resourceURL?.protocol;
+
+    // The ebook renderer uses a custom ebook:// scheme for its shell and EPUB entry
+    // loading. Treating those fetch/XHR calls like normal web requests makes the
+    // blocking layer reject them with a generic "Load failed" error before the
+    // renderer can open the book.
+    if (pageProtocol === 'ebook:' || resourceProtocol === 'ebook:') {
+      return true;
+    }
+
+    return false;
+  });
   const sendMessage = $((resourceURL) => {
     // when location.href does not match origin, we include origin in console
     const originDisplay = window.location.href !== $.windowOrigin ? ` (${$.windowOrigin})` : ``;
@@ -63,6 +77,9 @@ window.__firefox__.execute(function($) {
     }
 
     const url = new URL(urlString, window.location.href)
+    if (shouldBypassBlocking(url)) {
+      return originalFetch.apply(this, arguments)
+    }
     return sendMessage(url).then(blocked => {
       if (blocked) {
         return Promise.reject(new TypeError('Load failed'))
@@ -103,6 +120,10 @@ window.__firefox__.execute(function($) {
       resourceURL = new URL(this[localURLProp], window.location.href)
     } catch (error) {
       // Ignore this error and proceed like a regular request
+      return originalSend.apply(this, arguments)
+    }
+
+    if (shouldBypassBlocking(resourceURL)) {
       return originalSend.apply(this, arguments)
     }
 

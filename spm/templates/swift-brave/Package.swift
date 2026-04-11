@@ -5,7 +5,7 @@ let package = Package(
     name: "SwiftBrave",
     platforms: [
         .iOS(.v15),
-        .macOS(.v14)
+        .macOS("15.0")
     ],
     products: [
         .library(
