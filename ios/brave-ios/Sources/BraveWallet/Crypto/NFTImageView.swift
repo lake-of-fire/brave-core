@@ -66,7 +66,7 @@ struct NFTImageView<Placeholder: View>: View {
 
 struct LoadingNFTView: View {
   var shimmer: Bool = true
-  @State var viewSize: CGSize = .zero
+  @State private var viewSize: CGSize = .zero
 
   private var fontSizeForNFTImage: CGFloat {
     guard viewSize.width > 0 else { return 12 }

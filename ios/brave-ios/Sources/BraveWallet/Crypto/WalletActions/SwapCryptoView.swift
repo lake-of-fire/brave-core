@@ -194,7 +194,7 @@ struct SwapCryptoView: View {
   @ObservedObject var swapTokensStore: SwapTokenStore
 
   @State private var orderType: OrderType = .market
-  @State var hideSlippage = true
+  @State private var hideSlippage = true
   @State private var isSwapDisclaimerVisible: Bool = false
 
   @Environment(\.openURL) private var openWalletURL

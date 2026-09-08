@@ -14,9 +14,9 @@ struct MediaSettingsView: View {
   @ObservedObject var keepYouTubeInBrave = Preferences.General.keepYouTubeInBrave
   @ObservedObject var filterListStorage = FilterListStorage.shared
 
-  @State var youtubeRecommendationsBlocking = false
-  @State var youtubeDistractingElementsBlocking = false
-  @State var youtubeShortsBlocking = false
+  @State private var youtubeRecommendationsBlocking = false
+  @State private var youtubeDistractingElementsBlocking = false
+  @State private var youtubeShortsBlocking = false
 
   var body: some View {
     Form {

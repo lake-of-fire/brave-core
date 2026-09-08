@@ -18,7 +18,7 @@ struct MarketView: View {
   @ScaledMetric private var coinLength: CGFloat = 40
   private let maxCoinSize: CGFloat = 80.0
 
-  @State var allCoingeckoTokens: [BraveWallet.BlockchainToken] = []
+  @State private var allCoingeckoTokens: [BraveWallet.BlockchainToken] = []
   @State private var selectedCoinMarket: BraveWallet.CoinMarket?
 
   @Environment(\.sizeCategory) private var sizeCategory

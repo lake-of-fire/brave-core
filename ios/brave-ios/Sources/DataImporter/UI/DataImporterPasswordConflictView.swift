@@ -14,7 +14,7 @@ struct DataImporterPasswordConflictView: View {
   private var dismiss
 
   @State
-  var sheetHeight: CGFloat = 0.0
+  private var sheetHeight: CGFloat = 0.0
 
   var model: SafariDataImportModel
 
