@@ -1,7 +1,7 @@
 # SwiftBrave generation and patches
 
-- `make-spm` delegates to `spm/make_spm.py`: clear destination, copy `templates/swift-brave`, copy upstream adblock sources, apply `patches/*.patch` in filename order, then optional build/tests. Do not run it over unpreserved local edits.
-- Change package-owned Swift code in its canonical template/overlay; use ordered patches for copied upstream source. Reconcile the generated `swift-brave` output and link both PRs. Do not rely on output-only fixes surviving regeneration.
-- Locate the actual WebMedia source of truth first. The published generator currently lacks its Swift overlay; a local generated file alone does not prove its canonical source or branch. Never replace newer local media work with an older published snapshot.
-- Compare relevant Brave upstream changes and preserve provenance/license notices. Keep unrelated coordinator or application changes out of a patch-only task.
-- Respect the current task's verification limits and report generation/build/tests separately. Keep `templates/swift-brave/AGENTS.md` aligned with this workflow so generated packages retain the instructions.
+- `make-spm` delegates to `spm/make_spm.py`: clear output, copy `templates/swift-brave`, copy upstream adblock sources, apply `patches/*.patch` in filename order, then optional build/tests. Preserve all local edits before generation.
+- WebMedia's durable Swift/resource/test inputs live under `templates/swift-brave/{Sources/WebMedia,Tests/WebMediaTests}`. Edit those templates, then reconcile the generated package. Use ordered patches for copied upstream adblock source.
+- The template Package.swift uses the locally built XCFramework path. Release tooling rewrites only that binary target to its published URL/checksum; do not confuse package generation with a binary release.
+- Keep generated-output and canonical-input PRs linked. Preserve newer local work and upstream license/provenance notices. Updating Brave alone does not fix the custom retention/storage layer.
+- Follow the current task's verification limits. Report generation, compilation and runtime checks separately. Keep the generated AGENTS.md template aligned with this workflow.
