@@ -534,7 +534,7 @@ final class WebMediaTests: XCTestCase {
                     headerFields: nil
                 )!
             } else {
-                XCTAssertEqual(request.value(forHTTPHeaderField: "Range"), "bytes=0-1")
+                XCTAssertEqual(request.value(forHTTPHeaderField: "Range"), "bytes=0-4095")
                 response = HTTPURLResponse(
                     url: try XCTUnwrap(request.url),
                     statusCode: 206,
@@ -564,6 +564,104 @@ final class WebMediaTests: XCTestCase {
     }
 
     func testMediaStreamerFallsBackWhenPrimaryURLIsBlob() async throws {
+        var fallbackItem = WebMediaInfo(
+            name: "Fallback",
+            src: "https://r1.googlevideo.com/videoplayback?id=fixture",
+            pageSrc: "https://www.youtube.com/watch?v=abcdefghijk",
+            pageTitle: "Fallback",
+            mimeType: "video/mp4",
+            duration: 15,
+            detected: true,
+            tagId: "fallback-1",
+            isInvisible: false
+        )
+
+        fallbackItem.durableResourceIdentity = "provider:youtube:abcdefghijk"
+
+        URLProtocolStub.handler = { request in
+            let response = HTTPURLResponse(
+                url: try XCTUnwrap(request.url),
+                statusCode: 200,
+                httpVersion: nil,
+                headerFields: ["Content-Type": "video/mp4"]
+            )!
+            return (response, Data())
+        }
+
+        let streamer = WebMediaStreamer(
+            urlSession: makeSession(),
+            webLoaderFactory: MockLoaderFactory(item: fallbackItem)
+        )
+
+        var item = WebMediaInfo(
+            name: "Blob",
+            src: "blob:https://www.youtube.com/123",
+            pageSrc: "https://www.youtube.com/watch?v=abcdefghijk",
+            pageTitle: "Blob",
+            mimeType: "",
+            duration: 15,
+            detected: true,
+            tagId: "blob-1",
+            isInvisible: false
+        )
+
+        item.durableResourceIdentity = "provider:youtube:abcdefghijk"
+        let resolved = try await streamer.resolveMedia(item)
+        XCTAssertEqual(resolved.mediaInfo.resourceLookupKey, item.resourceLookupKey)
+        XCTAssertEqual(resolved.url.absoluteString, fallbackItem.src)
+        XCTAssertEqual(resolved.resolutionMethod, .fallback)
+    }
+
+    func testMediaStreamerStopsFallbackLoaderAfterResolution() async throws {
+        var fallbackItem = WebMediaInfo(
+            name: "Fallback",
+            src: "https://r1.googlevideo.com/videoplayback?id=fixture",
+            pageSrc: "https://www.youtube.com/watch?v=abcdefghijk",
+            pageTitle: "Fallback",
+            mimeType: "video/mp4",
+            duration: 15,
+            detected: true,
+            tagId: "fallback-1",
+            isInvisible: false
+        )
+
+        fallbackItem.durableResourceIdentity = "provider:youtube:abcdefghijk"
+
+        URLProtocolStub.handler = { request in
+            let response = HTTPURLResponse(
+                url: try XCTUnwrap(request.url),
+                statusCode: 200,
+                httpVersion: nil,
+                headerFields: ["Content-Type": "video/mp4"]
+            )!
+            return (response, Data())
+        }
+
+        let factory = MockLoaderFactory(item: fallbackItem)
+        let streamer = WebMediaStreamer(
+            urlSession: makeSession(),
+            webLoaderFactory: factory
+        )
+
+        var item = WebMediaInfo(
+            name: "Blob",
+            src: "blob:https://www.youtube.com/123",
+            pageSrc: "https://www.youtube.com/watch?v=abcdefghijk",
+            pageTitle: "Blob",
+            mimeType: "",
+            duration: 15,
+            detected: true,
+            tagId: "blob-1",
+            isInvisible: false
+        )
+
+        item.durableResourceIdentity = "provider:youtube:abcdefghijk"
+        let resolved = try await streamer.resolveMedia(item)
+        XCTAssertEqual(resolved.mediaInfo.resourceLookupKey, item.resourceLookupKey)
+        XCTAssertEqual(factory.loader.stopCallCount, 1)
+    }
+
+    func testMediaStreamerRejectsFallbackForDifferentResource() async throws {
         let fallbackItem = WebMediaInfo(
             name: "Fallback",
             src: "https://media.example.com/video.mp4",
@@ -603,55 +701,14 @@ final class WebMediaTests: XCTestCase {
             isInvisible: false
         )
 
-        let resolved = try await streamer.resolveMedia(item)
-        XCTAssertEqual(resolved.url.absoluteString, fallbackItem.src)
-        XCTAssertEqual(resolved.resolutionMethod, .fallback)
-    }
-
-    func testMediaStreamerStopsFallbackLoaderAfterResolution() async throws {
-        let fallbackItem = WebMediaInfo(
-            name: "Fallback",
-            src: "https://media.example.com/video.mp4",
-            pageSrc: "https://example.com/watch/1",
-            pageTitle: "Fallback",
-            mimeType: "video/mp4",
-            duration: 15,
-            detected: true,
-            tagId: "fallback-1",
-            isInvisible: false
-        )
-
-        URLProtocolStub.handler = { request in
-            let response = HTTPURLResponse(
-                url: try XCTUnwrap(request.url),
-                statusCode: 200,
-                httpVersion: nil,
-                headerFields: ["Content-Type": "video/mp4"]
-            )!
-            return (response, Data())
+        do {
+            _ = try await streamer.resolveMedia(item)
+            XCTFail("A different media resource must not replace the requested resource")
+        } catch let error as WebMediaStreamer.PlaybackError {
+            XCTAssertEqual(error, .fallbackDidNotResolvePlayableMedia)
         }
-
-        let factory = MockLoaderFactory(item: fallbackItem)
-        let streamer = WebMediaStreamer(
-            urlSession: makeSession(),
-            webLoaderFactory: factory
-        )
-
-        let item = WebMediaInfo(
-            name: "Blob",
-            src: "blob:https://example.com/123",
-            pageSrc: "https://example.com/watch/1",
-            pageTitle: "Blob",
-            mimeType: "",
-            duration: 15,
-            detected: true,
-            tagId: "blob-1",
-            isInvisible: false
-        )
-
-        _ = try await streamer.resolveMedia(item)
-        XCTAssertEqual(factory.loader.stopCallCount, 1)
     }
+
 
     func testMediaStreamerThrowsFallbackUnavailableForBlobWithoutResolver() async {
         let streamer = WebMediaStreamer(urlSession: makeSession())
@@ -2259,12 +2316,12 @@ final class WebMediaTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: rootURL) }
 
         let downloader = MockArtifactDownloader()
-        let store = WebMediaOfflineStore(
+        var store = WebMediaOfflineStore(
             configuration: .init(
                 persistentRootURL: rootURL.appendingPathComponent("persistent", isDirectory: true),
                 transientRootURL: rootURL.appendingPathComponent("transient", isDirectory: true),
                 excludeFromBackup: false,
-                transientStoragePolicy: .init(maxItemCount: 1, maxTotalByteCount: nil, maxAge: nil)
+                transientStoragePolicy: .init(maxItemCount: nil, maxTotalByteCount: nil, maxAge: nil)
             ),
             downloader: downloader,
             urlSession: makeSession()
@@ -2314,17 +2371,27 @@ final class WebMediaTests: XCTestCase {
             thumbnail: .none
         )
 
+        // Seed without quota enforcement, then reopen the same inventory with
+        // a quota. Download completion itself now applies the configured policy.
+        store = WebMediaOfflineStore(
+            configuration: .init(
+                persistentRootURL: rootURL.appendingPathComponent("persistent", isDirectory: true),
+                transientRootURL: rootURL.appendingPathComponent("transient", isDirectory: true),
+                excludeFromBackup: false,
+                transientStoragePolicy: .init(maxItemCount: 1, maxTotalByteCount: nil, maxAge: nil)
+            ),
+            downloader: downloader,
+            urlSession: makeSession()
+        )
+
         let allTransientBeforeTrim = try await store.allStoredMedia(scope: .transient)
         XCTAssertEqual(Set(allTransientBeforeTrim.map(\.id)), Set([first.id, second.id]))
 
-        try await store.enforceTransientStoragePolicy(exceptPageURLs: [URL(string: "https://example.com/watch?v=2")!])
+        try await store.enforceTransientStoragePolicy(exceptPageURLs: [URL(string: "https://example.com/watch?v=1")!])
         let allTransientWithCurrentPageExempt = try await store.allStoredMedia(scope: .transient)
-        XCTAssertEqual(Set(allTransientWithCurrentPageExempt.map(\.id)), Set([first.id, second.id]))
-
-        try await store.enforceTransientStoragePolicy()
-        let allTransientAfterTrim = try await store.allStoredMedia(scope: .transient)
-        XCTAssertEqual(allTransientAfterTrim.map(\.id), [second.id])
-        XCTAssertFalse(FileManager.default.fileExists(atPath: first.localMediaURL.path))
+        XCTAssertEqual(allTransientWithCurrentPageExempt.map(\.id), [first.id])
+        XCTAssertTrue(FileManager.default.fileExists(atPath: first.localMediaURL.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: second.localMediaURL.path))
     }
 
     func testAssetDownloaderUsesHLSDownloaderPath() async throws {
@@ -2403,9 +2470,10 @@ final class WebMediaTests: XCTestCase {
             let partialURL = directory.appendingPathComponent("media.partial", isDirectory: false)
             try Data("hello".utf8).write(to: partialURL)
             try writeResumeIdentity(for: media, in: directory)
+            let requestLock = NSLock()
+            var requests: [URLRequest] = []
             URLProtocolStub.handler = { request in
-                XCTAssertEqual(request.value(forHTTPHeaderField: "Range"), "bytes=5-")
-                XCTAssertEqual(request.value(forHTTPHeaderField: "If-Range"), "\"fixture-v1\"")
+                requestLock.withLock { requests.append(request) }
                 var headers = ["Content-Type": "video/mp4", "ETag": "\"fixture-v1\""]
                 if let contentRange = invalidRange.contentRange {
                     headers["Content-Range"] = contentRange
@@ -2433,6 +2501,12 @@ final class WebMediaTests: XCTestCase {
                 XCTFail("Expected invalidResponse for \(invalidRange.name), received \(error)")
             }
 
+            let observedRequests = requestLock.withLock { requests }
+            XCTAssertEqual(observedRequests.count, 2)
+            XCTAssertEqual(observedRequests.first?.value(forHTTPHeaderField: "Range"), "bytes=5-")
+            XCTAssertEqual(observedRequests.first?.value(forHTTPHeaderField: "If-Range"), "\"fixture-v1\"")
+            XCTAssertNil(observedRequests.last?.value(forHTTPHeaderField: "Range"))
+            XCTAssertNil(observedRequests.last?.value(forHTTPHeaderField: "If-Range"))
             XCTAssertEqual(try Data(contentsOf: partialURL), Data("hello".utf8))
             XCTAssertFalse(FileManager.default.fileExists(
                 atPath: directory.appendingPathComponent("media.mp4", isDirectory: false).path
@@ -2608,8 +2682,10 @@ final class WebMediaTests: XCTestCase {
         let partial = directory.appendingPathComponent("media.partial")
         try Data("hello".utf8).write(to: partial)
         try writeResumeIdentity(for: media, in: directory)
+        let requestLock = NSLock()
+        var requests: [URLRequest] = []
         URLProtocolStub.handler = { request in
-            XCTAssertEqual(request.value(forHTTPHeaderField: "If-Range"), "\"fixture-v1\"")
+            requestLock.withLock { requests.append(request) }
             return (HTTPURLResponse(url: try XCTUnwrap(request.url), statusCode: 206, httpVersion: nil,
                                    headerFields: ["ETag": "\"fixture-v2\"", "Content-Range": "bytes 5-9/10"])!,
                     Data("other".utf8))
@@ -2622,6 +2698,12 @@ final class WebMediaTests: XCTestCase {
         } catch let error as WebMediaOfflineStoreError {
             XCTAssertEqual(error, .invalidResponse)
         }
+        let observedRequests = requestLock.withLock { requests }
+        XCTAssertEqual(observedRequests.count, 2)
+        XCTAssertEqual(observedRequests.first?.value(forHTTPHeaderField: "Range"), "bytes=5-")
+        XCTAssertEqual(observedRequests.first?.value(forHTTPHeaderField: "If-Range"), "\"fixture-v1\"")
+        XCTAssertNil(observedRequests.last?.value(forHTTPHeaderField: "Range"))
+        XCTAssertNil(observedRequests.last?.value(forHTTPHeaderField: "If-Range"))
         XCTAssertEqual(try Data(contentsOf: partial), Data("hello".utf8))
         XCTAssertFalse(FileManager.default.fileExists(atPath: directory.appendingPathComponent("media.mp4").path))
         XCTAssertFalse(FileManager.default.fileExists(atPath: directory.appendingPathComponent("media.partial.identity.json").path))
@@ -2640,12 +2722,12 @@ final class WebMediaTests: XCTestCase {
             persistentRootURL: persistent, transientRootURL: root.appendingPathComponent("transient"),
             excludeFromBackup: false
         ))
-        do {
-            _ = try await store.allDownloadRecords()
-            XCTFail("Unreadable metadata must be surfaced")
-        } catch is DecodingError {
-            // The directory remains recoverable rather than being treated as orphaned.
-        }
+        let records = try await store.allDownloadRecords()
+        XCTAssertTrue(records.isEmpty)
+        let issues = await store.recoveryIssues()
+        XCTAssertEqual(issues.count, 1)
+        XCTAssertEqual(issues.first?.directoryURL.standardizedFileURL.path, item.standardizedFileURL.path)
+        XCTAssertFalse(try XCTUnwrap(issues.first).description.isEmpty)
         XCTAssertEqual(try Data(contentsOf: item.appendingPathComponent("media.mp4")), original)
         XCTAssertTrue(FileManager.default.fileExists(atPath: item.appendingPathComponent("metadata.json").path))
     }
