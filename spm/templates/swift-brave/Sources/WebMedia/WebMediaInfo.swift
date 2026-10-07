@@ -28,6 +28,9 @@ public struct WebMediaInfo: Codable, Hashable, Identifiable, Sendable {
     public var detected: Bool
     public var tagId: String
     public var isInvisible: Bool
+    /// Set by native provider admission after matching the player resource to
+    /// its frame. JavaScript detector payloads cannot supply this authority.
+    public var durableResourceIdentity: String?
 
     public var id: String {
         tagId
@@ -54,9 +57,34 @@ public struct WebMediaInfo: Codable, Hashable, Identifiable, Sendable {
         )
     }
 
-    /// Identifies the concrete page media resource without changing the
-    /// DOM-oriented candidate key used by page-level callers.
+    /// Durable identity of the page's media resource. DOM tags, display names
+    /// and measured durations can change on every visit and are not storage keys.
     public var resourceLookupKey: String {
+        if let identity = durableResourceIdentity {
+            if identity == sourceBasedResourceLookupKey { return identity }
+            if identity.hasPrefix("provider:youtube:"),
+               let videoID = identity.split(separator: ":").last.map(String.init),
+               identity == "provider:youtube:\(videoID)",
+               (Self.youtubeVideoID(in: pageURL) == videoID || Self.youtubeVideoID(in: sourceURL) == videoID),
+               Self.isYouTubeMediaSource(sourceURL, providerPage: pageURL) {
+                return "provider:youtube:\(videoID)"
+            }
+        }
+        return sourceBasedResourceLookupKey
+    }
+
+    public var sourceBasedResourceLookupKey: String {
+        Self.resourceLookupKey(pageSrc: pageSrc, source: src)
+    }
+
+    public func referencesSameResource(as other: WebMediaInfo) -> Bool {
+        resourceLookupKey == other.resourceLookupKey
+            || sourceBasedResourceLookupKey == other.sourceBasedResourceLookupKey
+    }
+
+    /// Identifies one live element/resource binding. Use this for playback
+    /// receipts and document fencing, never for offline or transcript reuse.
+    public var playbackInstanceLookupKey: String {
         Self.resourceLookupKey(candidateLookupKey: candidateLookupKey, source: src)
     }
 
@@ -191,7 +219,8 @@ public struct WebMediaInfo: Codable, Hashable, Identifiable, Sendable {
         duration: TimeInterval,
         detected: Bool,
         tagId: String,
-        isInvisible: Bool
+        isInvisible: Bool,
+        durableResourceIdentity: String? = nil
     ) {
         self.name = name
         self.src = Self.fixSchemelessURLs(src: src, pageSrc: pageSrc)
@@ -202,6 +231,7 @@ public struct WebMediaInfo: Codable, Hashable, Identifiable, Sendable {
         self.detected = detected
         self.tagId = tagId.isEmpty ? UUID().uuidString : tagId
         self.isInvisible = isInvisible
+        self.durableResourceIdentity = durableResourceIdentity
     }
 
     public init(from decoder: Decoder) throws {
@@ -218,9 +248,12 @@ public struct WebMediaInfo: Codable, Hashable, Identifiable, Sendable {
         self.detected = try container.decodeIfPresent(Bool.self, forKey: .detected) ?? false
         self.tagId = try container.decodeIfPresent(String.self, forKey: .tagId) ?? UUID().uuidString
         self.isInvisible = try container.decodeIfPresent(Bool.self, forKey: .isInvisible) ?? false
+        self.durableResourceIdentity = try container.decodeIfPresent(String.self, forKey: .durableResourceIdentity)
     }
 
     public static func decode(from body: Any) -> WebMediaInfo? {
+        guard var body = body as? [String: Any] else { return nil }
+        body.removeValue(forKey: "durableResourceIdentity")
         guard JSONSerialization.isValidJSONObject(body),
               let data = try? JSONSerialization.data(withJSONObject: body, options: [.fragmentsAllowed])
         else {
@@ -241,12 +274,7 @@ public struct WebMediaInfo: Codable, Hashable, Identifiable, Sendable {
     }
 
     public static func pageLookupKey(for pageSrc: String) -> String {
-        guard var components = URLComponents(string: pageSrc) else {
-            return pageSrc.split(separator: "#", maxSplits: 1).first.map(String.init) ?? pageSrc
-        }
-
-        components.fragment = nil
-        return components.string ?? pageSrc
+        canonicalSourceLookupKey(for: pageSrc)
     }
 
     public static func candidateLookupKey(
@@ -263,10 +291,20 @@ public struct WebMediaInfo: Codable, Hashable, Identifiable, Sendable {
         let sanitizedName = name
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()
-        let roundedDuration = Int(duration.rounded())
+        let roundedDuration = duration.isFinite && duration >= 0 && duration < Double(Int.max)
+            ? Int(duration.rounded(.down)) : 0
         return "\(pageKey)::\(sanitizedName)::\(roundedDuration)"
     }
 
+    public static func resourceLookupKey(pageSrc: String, source: String) -> String {
+        // Length prefixes keep arbitrary URL contents from colliding with a
+        // separator. Query parameters remain significant, including signed URLs.
+        let page = pageLookupKey(for: pageSrc)
+        let resource = canonicalSourceLookupKey(for: source)
+        return "web-media-resource-v2:\(page.utf8.count):\(page)\(resource.utf8.count):\(resource)"
+    }
+
+    /// Compatibility form for live playback bindings saved by earlier clients.
     public static func resourceLookupKey(candidateLookupKey: String, source: String) -> String {
         "\(candidateLookupKey)\u{1F}\(canonicalSourceLookupKey(for: source))"
     }
@@ -277,7 +315,51 @@ public struct WebMediaInfo: Codable, Hashable, Identifiable, Sendable {
         }
 
         components.fragment = nil
+        components.scheme = components.scheme?.lowercased()
+        components.host = components.host?.lowercased()
+        if (components.scheme == "https" && components.port == 443)
+            || (components.scheme == "http" && components.port == 80) {
+            components.port = nil
+        }
         return components.string ?? source
+    }
+
+    private static func youtubeVideoID(in url: URL?) -> String? {
+        guard let url, url.scheme?.lowercased() == "https", url.user == nil, url.password == nil,
+              url.port == nil || url.port == 443,
+              let host = url.host?.lowercased(),
+              ["youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com",
+               "youtube-nocookie.com", "www.youtube-nocookie.com", "youtu.be", "www.youtu.be"].contains(host) else { return nil }
+        let segments = url.path.split(separator: "/")
+        let videoID: String?
+        if host == "youtu.be" || host == "www.youtu.be" {
+            videoID = segments.count == 1 ? String(segments[0]) : nil
+        } else if segments.count == 2, ["embed", "shorts", "live"].contains(String(segments[0])) {
+            videoID = String(segments[1])
+        } else if url.path == "/watch" {
+            let values = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.filter { $0.name == "v" } ?? []
+            videoID = values.count == 1 ? values[0].value : nil
+        } else { videoID = nil }
+        guard let videoID, videoID.utf8.count == 11,
+              videoID.utf8.allSatisfy({ (48...57).contains($0) || (65...90).contains($0)
+                || (97...122).contains($0) || $0 == 45 || $0 == 95 }) else { return nil }
+        return videoID
+    }
+
+    private static func isYouTubeMediaSource(_ source: URL?, providerPage: URL?) -> Bool {
+        guard let source else { return false }
+        if source.scheme?.lowercased() == "blob" {
+            guard let origin = URL(string: String(source.absoluteString.dropFirst(5))),
+                  origin.scheme?.lowercased() == "https", origin.user == nil, origin.password == nil,
+                  origin.host?.lowercased() == providerPage?.host?.lowercased(),
+                  (origin.port ?? 443) == 443 else { return false }
+            return true
+        }
+        guard source.scheme?.lowercased() == "https", source.user == nil, source.password == nil,
+              (source.port ?? 443) == 443, let host = source.host?.lowercased() else { return false }
+        return host == "googlevideo.com" || host.hasSuffix(".googlevideo.com")
+            || ["youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com",
+                "youtube-nocookie.com", "www.youtube-nocookie.com"].contains(host)
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -290,11 +372,14 @@ public struct WebMediaInfo: Codable, Hashable, Identifiable, Sendable {
         case detected
         case tagId
         case isInvisible = "invisible"
+        case durableResourceIdentity
     }
 
     private static let hlsMimeTypes: Set<String> = [
         "application/vnd.apple.mpegurl",
         "application/x-mpegurl",
+        "audio/mpegurl",
+        "audio/x-mpegurl",
     ]
 
     private static let audioOnlyMarkers: Set<String> = [

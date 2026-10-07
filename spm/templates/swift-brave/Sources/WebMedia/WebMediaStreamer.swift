@@ -44,6 +44,22 @@ public struct ResolvedWebMedia: Hashable, Sendable {
     public let requestHeaders: [String: String]
     public let resolutionMethod: WebMediaResolutionMethod
 
+    public var containerKind: WebMediaContainerKind {
+        let resolvedType = WebMediaMimeTypeDetector(mimeType: mimeType).mimeType
+        if resolvedType == "application/vnd.apple.mpegurl"
+            || resolvedType == "application/x-mpegurl"
+            || resolvedType == "audio/mpegurl"
+            || resolvedType == "audio/x-mpegurl"
+            || url.pathExtension.lowercased() == "m3u8" {
+            return .hls
+        }
+        if let resolvedType, resolvedType.hasPrefix("audio/") || resolvedType.hasPrefix("video/")
+            || resolvedType == "application/ogg" {
+            return .file
+        }
+        return mediaInfo.containerKind
+    }
+
     public init(
         mediaInfo: WebMediaInfo,
         url: URL,
@@ -82,13 +98,17 @@ public final class WebMediaStreamer: @unchecked Sendable {
         _ item: WebMediaInfo,
         requestContext: WebMediaRequestContext = .init()
     ) async throws -> ResolvedWebMedia {
+        try Task.checkCancellation()
         guard item.sourceURL != nil else {
             throw PlaybackError.unsupportedSource
         }
 
         if let resolved = await resolveDirectMedia(item, requestContext: requestContext, method: .direct) {
+            try Task.checkCancellation()
             return resolved
         }
+
+        try Task.checkCancellation()
 
         if item.pageURL != nil, webLoaderFactory != nil {
             return try await resolveViaFallback(item, requestContext: requestContext)
@@ -101,39 +121,43 @@ public final class WebMediaStreamer: @unchecked Sendable {
         throw PlaybackError.couldNotDeterminePlayableMedia
     }
 
+    private enum MediaProbeResult: Sendable {
+        case media(String)
+        case nonMedia
+        case unavailable
+    }
+
     public static func getMimeType(
         _ url: URL,
         requestContext: WebMediaRequestContext = .init(),
         using session: URLSession = .shared
     ) async -> String? {
-        switch url.scheme?.lowercased() {
-        case "http", "https":
-            break
-        default:
-            return nil
+        if case .media(let mimeType) = await probeMediaType(url, requestContext: requestContext, using: session) {
+            return mimeType
         }
+        return nil
+    }
 
-        let probeRequests = [
-            makeProbeRequest(
-                url: url,
-                method: "HEAD",
-                requestContext: requestContext
-            ),
-            makeProbeRequest(
-                url: url,
-                method: "GET",
-                requestContext: requestContext,
-                range: "bytes=0-1"
-            ),
+    private static func probeMediaType(
+        _ url: URL,
+        requestContext: WebMediaRequestContext,
+        using session: URLSession
+    ) async -> MediaProbeResult {
+        guard ["http", "https"].contains(url.scheme?.lowercased() ?? "") else { return .unavailable }
+        let requests = [
+            makeProbeRequest(url: url, method: "HEAD", requestContext: requestContext),
+            makeProbeRequest(url: url, method: "GET", requestContext: requestContext, range: "bytes=0-4095"),
         ]
-
-        for request in probeRequests {
-            if let mimeType = await probeMimeType(for: request, using: session) {
-                return mimeType
+        var foundNonMedia = false
+        for request in requests {
+            guard !Task.isCancelled else { return .unavailable }
+            switch await probeMimeType(for: request, using: session) {
+            case .media(let mimeType): return .media(mimeType)
+            case .nonMedia: foundNonMedia = true
+            case .unavailable: break
             }
         }
-
-        return nil
+        return foundNonMedia ? .nonMedia : .unavailable
     }
 
     private func resolveViaFallback(
@@ -149,7 +173,12 @@ public final class WebMediaStreamer: @unchecked Sendable {
         let loader = webLoaderFactory.makeWebLoader()
         defer { loader.stop() }
         guard let fallbackItem = await loader.load(url: pageURL) else {
+            try Task.checkCancellation()
             throw PlaybackError.fallbackUnavailable
+        }
+        try Task.checkCancellation()
+        guard fallbackItem.referencesSameResource(as: item) else {
+            throw PlaybackError.fallbackDidNotResolvePlayableMedia
         }
         guard let resolved = await resolveDirectMedia(
             fallbackItem,
@@ -159,7 +188,10 @@ public final class WebMediaStreamer: @unchecked Sendable {
             throw PlaybackError.fallbackDidNotResolvePlayableMedia
         }
 
-        return resolved
+        // A resolver may find a new transport URL; it does not own a new media
+        // identity. Keep the requested resource as the presentation owner.
+        return ResolvedWebMedia(mediaInfo: item, url: resolved.url, mimeType: resolved.mimeType,
+                                requestHeaders: resolved.requestHeaders, resolutionMethod: .fallback)
     }
 
     private func resolveDirectMedia(
@@ -168,17 +200,30 @@ public final class WebMediaStreamer: @unchecked Sendable {
         method: WebMediaResolutionMethod
     ) async -> ResolvedWebMedia? {
         guard let url = item.sourceURL,
+              ["http", "https", "file"].contains(url.scheme?.lowercased() ?? ""),
               item.isBlobSource == false,
               item.isDataSource == false
         else {
             return nil
         }
 
-        let mimeType = await Self.getMimeType(url, requestContext: requestContext, using: urlSession)
-            ?? Self.normalizedMimeType(item.mimeType)
-
-        guard mimeType != nil || item.isHTTPSource == false else {
-            return nil
+        let mimeType: String?
+        if url.isFileURL {
+            guard FileManager.default.fileExists(atPath: url.path) else { return nil }
+            mimeType = Self.playableMimeType(Self.normalizedMimeType(item.mimeType))
+                ?? Self.playableMimeType(WebMediaMimeTypeDetector(url: url).mimeType)
+        } else {
+            switch await Self.probeMediaType(url, requestContext: requestContext, using: urlSession) {
+            case .media(let resolved): mimeType = resolved
+            case .nonMedia:
+                // A stale detector hint cannot turn a login/watch HTML page or
+                // a JSON error response into a playable media resource.
+                return nil
+            case .unavailable:
+                mimeType = Self.playableMimeType(Self.normalizedMimeType(item.mimeType))
+                    ?? Self.playableMimeType(WebMediaMimeTypeDetector(url: url).mimeType)
+                guard mimeType != nil else { return nil }
+            }
         }
 
         return ResolvedWebMedia(
@@ -198,7 +243,7 @@ public final class WebMediaStreamer: @unchecked Sendable {
             .split(separator: ";", maxSplits: 1, omittingEmptySubsequences: true)
             .first?
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed?.isEmpty == false ? trimmed : nil
+        return trimmed?.isEmpty == false ? trimmed?.lowercased() : nil
     }
 
     private static func makeProbeRequest(
@@ -214,30 +259,63 @@ public final class WebMediaStreamer: @unchecked Sendable {
         )
         request.httpMethod = method
         request.setValue(UUID().uuidString, forHTTPHeaderField: "X-Playback-Session-Id")
-        if let range {
-            request.setValue(range, forHTTPHeaderField: "Range")
-        }
         for (name, value) in requestContext.headers {
             request.setValue(value, forHTTPHeaderField: name)
         }
+        request.setValue(range, forHTTPHeaderField: "Range")
+        request.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
         return request
+    }
+
+    private static func playableMimeType(_ mimeType: String?) -> String? {
+        guard let mimeType,
+              (mimeType.hasPrefix("audio/") && mimeType.count > 6)
+                || (mimeType.hasPrefix("video/") && mimeType.count > 6)
+                || mimeType == "application/vnd.apple.mpegurl" || mimeType == "application/x-mpegurl"
+                || mimeType == "application/ogg" else { return nil }
+        return mimeType
     }
 
     private static func probeMimeType(
         for request: URLRequest,
         using session: URLSession
-    ) async -> String? {
+    ) async -> MediaProbeResult {
         do {
-            let (_, response) = try await session.data(for: request)
-            guard let response = response as? HTTPURLResponse else {
-                return nil
+            guard let url = request.url else { return .unavailable }
+            let (bytes, response) = try await session.bytes(for: request,
+                delegate: WebMediaRequestRedirectPolicy(url: url, maximumRedirects: 4))
+            // A server may ignore Range. Never read more than the bounded prefix,
+            // and cancel the transport even when the MIME is known from headers.
+            defer { bytes.task.cancel() }
+            guard let response = response as? HTTPURLResponse else { return .unavailable }
+            guard (200...299).contains(response.statusCode) else {
+                return request.httpMethod == "HEAD" && [405, 501].contains(response.statusCode)
+                    ? .unavailable : .nonMedia
             }
-            guard response.statusCode == 302 || (200...299).contains(response.statusCode) else {
-                return nil
+            let mimeType = normalizedMimeType(response.value(forHTTPHeaderField: "Content-Type"))
+            if let playable = playableMimeType(mimeType) { return .media(playable) }
+            let declaresDocument = mimeType.map {
+                $0.hasPrefix("text/") || $0 == "application/json" || $0.hasSuffix("+json")
+                    || $0 == "application/xml" || $0.hasSuffix("+xml")
+            } ?? false
+            guard request.httpMethod != "HEAD" else { return declaresDocument ? .nonMedia : .unavailable }
+            var prefix = Data()
+            for try await byte in bytes {
+                try Task.checkCancellation()
+                prefix.append(byte)
+                if prefix.count >= 4096 { break }
             }
-            return normalizedMimeType(response.value(forHTTPHeaderField: "Content-Type"))
+            if let detected = WebMediaMimeTypeDetector(data: prefix).mimeType { return .media(detected) }
+            let text = String(data: prefix, encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines.union(CharacterSet(charactersIn: "\u{feff}")))
+                .lowercased()
+            let isDocument = text.map {
+                $0.hasPrefix("<!doctype") || $0.hasPrefix("<html") || $0.hasPrefix("<?xml")
+                    || $0.hasPrefix("{") || $0.hasPrefix("[") || $0.hasPrefix("webvtt")
+            } ?? false
+            return declaresDocument || isDocument || prefix.isEmpty ? .nonMedia : .unavailable
         } catch {
-            return nil
+            return .unavailable
         }
     }
 }

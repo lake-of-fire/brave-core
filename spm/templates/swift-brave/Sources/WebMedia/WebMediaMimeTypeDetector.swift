@@ -40,6 +40,14 @@ public struct WebMediaMimeTypeDetector {
     }
 
     public init(data: Data) {
+        if let prefix = String(data: data.prefix(4096), encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines.union(CharacterSet(charactersIn: "\u{feff}"))),
+           prefix.hasPrefix("#EXTM3U") {
+            mimeType = "application/vnd.apple.mpegurl"
+            fileExtension = "movpkg"
+            return
+        }
+
         if Self.findHeader(offset: 0, in: data, header: [0x1A, 0x45, 0xDF, 0xA3]) {
             mimeType = "video/webm"
             fileExtension = "webm"

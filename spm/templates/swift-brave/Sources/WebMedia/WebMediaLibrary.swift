@@ -1,5 +1,17 @@
 import Foundation
 
+public struct WebMediaPlaybackResolution: Hashable, Sendable {
+    public let media: ResolvedWebMedia
+    public let offlineMediaID: String?
+    public let fallback: ResolvedWebMedia?
+
+    public init(media: ResolvedWebMedia, offlineMediaID: String?, fallback: ResolvedWebMedia?) {
+        self.media = media
+        self.offlineMediaID = offlineMediaID
+        self.fallback = fallback
+    }
+}
+
 public actor WebMediaLibrary {
     private let mediaStreamer: WebMediaStreamer
     private let offlineStore: WebMediaOfflineStore
@@ -17,6 +29,81 @@ public actor WebMediaLibrary {
         requestContext: WebMediaRequestContext = .init()
     ) async throws -> ResolvedWebMedia {
         try await mediaStreamer.resolveMedia(item, requestContext: requestContext)
+    }
+
+    /// Resolves a saved selection without requiring a live page or a network
+    /// round trip for an already downloaded resource. An artifact ID alone is
+    /// never authority to play media belonging to a different source.
+    public func resolveForPlayback(
+        _ item: WebMediaInfo,
+        offlineMediaID: String? = nil,
+        sourceURL: URL? = nil,
+        requestContext: WebMediaRequestContext = .init()
+    ) async throws -> WebMediaPlaybackResolution {
+        try Task.checkCancellation()
+        var stored: StoredWebMedia?
+        if let offlineMediaID {
+            do {
+                if let candidate = try await offlineStore.storedMedia(id: offlineMediaID),
+                   candidate.mediaInfo.referencesSameResource(as: item) {
+                    stored = candidate
+                }
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                // Recovery diagnostics remain in the store. An unreadable
+                // artifact does not prevent using this owner's original source.
+            }
+        }
+        if stored == nil {
+            do {
+                stored = try await offlineStore.storedMedia(for: item)
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                // Preserve storage for recovery and continue source resolution.
+            }
+        }
+        try Task.checkCancellation()
+        if let stored {
+            let remoteURL = [sourceURL, stored.resolvedMediaURL, item.sourceURL]
+                .compactMap { $0 }
+                .first { ["http", "https"].contains($0.scheme?.lowercased() ?? "") }
+            let fallback = remoteURL.map {
+                ResolvedWebMedia(mediaInfo: item, url: $0, mimeType: stored.mimeType,
+                                 requestHeaders: requestContext.headers, resolutionMethod: .fallback)
+            }
+            return WebMediaPlaybackResolution(
+                media: stored.makeResolvedMedia(for: item), offlineMediaID: stored.id, fallback: fallback
+            )
+        }
+
+        var preferred = item
+        if let sourceURL { preferred.src = sourceURL.absoluteString }
+        let resolved: ResolvedWebMedia
+        do {
+            resolved = try await mediaStreamer.resolveMedia(preferred, requestContext: requestContext)
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            try Task.checkCancellation()
+            guard preferred.src != item.src else { throw error }
+            resolved = try await mediaStreamer.resolveMedia(item, requestContext: requestContext)
+        }
+        try Task.checkCancellation()
+        let fallback = item.sourceURL.flatMap { url -> ResolvedWebMedia? in
+            guard url != resolved.url, ["http", "https"].contains(url.scheme?.lowercased() ?? "") else {
+                return nil
+            }
+            return ResolvedWebMedia(mediaInfo: item, url: url, mimeType: item.normalizedMimeType,
+                                    requestHeaders: requestContext.headers, resolutionMethod: .fallback)
+        }
+        return WebMediaPlaybackResolution(
+            media: ResolvedWebMedia(mediaInfo: item, url: resolved.url, mimeType: resolved.mimeType,
+                                    requestHeaders: resolved.requestHeaders,
+                                    resolutionMethod: resolved.resolutionMethod),
+            offlineMediaID: nil, fallback: fallback
+        )
     }
 
     public func download(
@@ -53,6 +140,30 @@ public actor WebMediaLibrary {
             thumbnail: thumbnail,
             onProgress: onProgress
         )
+    }
+
+    /// The caller has already resolved and fenced the exact live player source.
+    /// Preserve that immutable owner/transport pair without a second page lookup.
+    public func download(
+        _ resolvedMedia: ResolvedWebMedia,
+        storageScope: WebMediaOfflineStorageScope,
+        retentionPolicy: WebMediaRetentionPolicy? = nil,
+        thumbnail: WebMediaThumbnailRequest = .automatic(),
+        onProgress: @escaping @Sendable (WebMediaDownloadProgress) -> Void = { _ in }
+    ) async throws -> StoredWebMedia {
+        try await offlineStore.download(resolvedMedia, storageScope: storageScope,
+                                        retentionPolicy: retentionPolicy, thumbnail: thumbnail, onProgress: onProgress)
+    }
+
+    public func enqueueDownload(
+        _ resolvedMedia: ResolvedWebMedia,
+        storageScope: WebMediaOfflineStorageScope,
+        retentionPolicy: WebMediaRetentionPolicy? = nil,
+        thumbnail: WebMediaThumbnailRequest = .automatic(),
+        onProgress: @escaping @Sendable (WebMediaDownloadProgress) -> Void = { _ in }
+    ) async throws -> WebMediaDownloadRecord {
+        try await offlineStore.enqueueDownload(resolvedMedia, storageScope: storageScope,
+                                               retentionPolicy: retentionPolicy, thumbnail: thumbnail, onProgress: onProgress)
     }
 
     public func waitForDownload(id: String) async throws -> StoredWebMedia {
@@ -114,12 +225,24 @@ public actor WebMediaLibrary {
         try await offlineStore.storedMedia(id: id)
     }
 
+    public func retainStoredMedia(id: String) async throws -> UUID {
+        try await offlineStore.retainStoredMedia(id: id)
+    }
+
+    public func releaseStoredMedia(id: String, leaseID: UUID) async {
+        await offlineStore.releaseStoredMedia(id: id, leaseID: leaseID)
+    }
+
     public func ensureThumbnail(id: String) async throws -> StoredWebMedia? {
         try await offlineStore.ensureThumbnail(id: id)
     }
 
     public func allStoredMedia(scope: WebMediaOfflineStorageScope? = nil) async throws -> [StoredWebMedia] {
         try await offlineStore.allStoredMedia(scope: scope)
+    }
+
+    public func recoveryIssues() async -> [WebMediaOfflineRecoveryIssue] {
+        await offlineStore.recoveryIssues()
     }
 
     @discardableResult
