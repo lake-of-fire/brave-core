@@ -1923,7 +1923,7 @@ final class WebMediaTests: XCTestCase {
         XCTAssertNotNil(manualAfterSession)
     }
 
-    func testOfflineStoreCanCancelAndRetryHLSDownload() async throws {
+    func testOfflineStoreCanCancelAndRetryHLSDownloadRejectingUnplayablePackage() async throws {
         let rootURL = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
         defer { try? FileManager.default.removeItem(at: rootURL) }
@@ -1969,6 +1969,7 @@ final class WebMediaTests: XCTestCase {
             thumbnail: .none
         )
 
+        await hlsDownloader.waitForBlockedDownloadStart()
         let isDownloadingInitially = try await store.isDownloading(id: record.id)
         XCTAssertTrue(isDownloadingInitially)
         let cancelled = try await store.cancelDownload(id: record.id)
@@ -1977,8 +1978,16 @@ final class WebMediaTests: XCTestCase {
 
         let retried = try await store.retryDownload(id: record.id)
         XCTAssertEqual(retried.state, .queued)
-        let stored = try await store.waitForDownload(id: record.id)
-        XCTAssertTrue(stored.localMediaURL.path.hasSuffix("media.movpkg"))
+        do {
+            _ = try await store.waitForDownload(id: record.id)
+            XCTFail("A synthetic HLS package must not be published as playable offline media")
+        } catch let error as WebMediaOfflineStoreError {
+            XCTAssertEqual(error, .downloadNotFinished)
+        }
+        let finalRecord = try await store.currentDownloadRecord(id: record.id)
+        XCTAssertEqual(finalRecord?.state, .failed)
+        let stored = try await store.storedMedia(id: record.id)
+        XCTAssertNil(stored)
     }
 
     func testOfflineStoreRestoresPendingDownloadsAfterRelaunch() async throws {
@@ -2400,21 +2409,17 @@ final class WebMediaTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: rootURL) }
 
         let hlsDownloader = MockHLSAssetDownloader()
-        let store = WebMediaOfflineStore(
-            configuration: .init(
-                persistentRootURL: rootURL.appendingPathComponent("persistent", isDirectory: true),
-                transientRootURL: rootURL.appendingPathComponent("transient", isDirectory: true),
-                excludeFromBackup: false
-            ),
-            downloader: WebMediaAssetDownloader(
-                urlSession: makeSession(),
-                hlsDownloaderFactory: { hlsDownloader }
-            ),
-            urlSession: makeSession()
+        let downloader = WebMediaAssetDownloader(
+            urlSession: makeSession(),
+            hlsDownloaderFactory: { hlsDownloader }
         )
+        URLProtocolStub.handler = { _ in
+            XCTFail("An HLS request must use the HLS collaborator rather than the file downloader")
+            throw WebMediaOfflineStoreError.invalidResponse
+        }
 
-        let storedMedia = try await store.download(
-            ResolvedWebMedia(
+        let artifact = try await downloader.download(
+            media: ResolvedWebMedia(
                 mediaInfo: WebMediaInfo(
                     name: "HLS Episode",
                     src: "https://cdn.example.com/master.m3u8",
@@ -2431,13 +2436,20 @@ final class WebMediaTests: XCTestCase {
                 requestHeaders: ["Cookie": "session=abc123"],
                 resolutionMethod: .direct
             ),
-            storageScope: .persistent,
-            thumbnail: .none
+            into: rootURL,
+            identifier: "hls-routing-fixture",
+            onProgress: { _ in }
         )
 
         XCTAssertTrue(hlsDownloader.didDownload)
-        XCTAssertEqual(hlsDownloader.lastIdentifier, storedMedia.id)
-        XCTAssertTrue(storedMedia.localMediaURL.path.hasSuffix("media.movpkg"))
+        XCTAssertEqual(hlsDownloader.lastIdentifier, "hls-routing-fixture")
+        XCTAssertEqual(artifact.relativeMediaPath, "media.movpkg")
+        XCTAssertEqual(artifact.mimeType, "application/vnd.apple.mpegurl")
+        XCTAssertEqual(artifact.byteCount, 7)
+        XCTAssertEqual(
+            try Data(contentsOf: rootURL.appendingPathComponent("media.movpkg/segment.ts")),
+            Data("segment".utf8)
+        )
     }
 
     func testAssetDownloaderRejectsInvalidPartialContentRangesWithoutMutatingPartial() async throws {
@@ -3036,6 +3048,22 @@ private final class SequencedArtifactDownloader: WebMediaArtifactDownloading, @u
     }
 }
 
+private actor HLSBlockedDownloadStart {
+    private var started = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func signal() {
+        started = true
+        for waiter in waiters { waiter.resume() }
+        waiters.removeAll()
+    }
+
+    func wait() async {
+        guard !started else { return }
+        await withCheckedContinuation { waiters.append($0) }
+    }
+}
+
 private final class SequencedHLSAssetDownloader: WebMediaHLSAssetDownloading, @unchecked Sendable {
     enum Step {
         case block(progress: WebMediaDownloadProgress)
@@ -3043,7 +3071,12 @@ private final class SequencedHLSAssetDownloader: WebMediaHLSAssetDownloading, @u
     }
 
     private let lock = NSLock()
+    private let blockedDownloadStart = HLSBlockedDownloadStart()
     private var steps: [Step]
+
+    func waitForBlockedDownloadStart() async {
+        await blockedDownloadStart.wait()
+    }
 
     init(steps: [Step]) {
         self.steps = steps
@@ -3062,6 +3095,7 @@ private final class SequencedHLSAssetDownloader: WebMediaHLSAssetDownloading, @u
 
         switch step {
         case .block(let progress):
+            await blockedDownloadStart.signal()
             onProgress(
                 WebMediaDownloadProgress(
                     id: identifier,
