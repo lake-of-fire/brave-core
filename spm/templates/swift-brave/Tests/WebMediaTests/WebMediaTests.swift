@@ -2721,6 +2721,184 @@ final class WebMediaTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: directory.appendingPathComponent("media.partial.identity.json").path))
     }
 
+    func testAssetDownloaderRetriesUnconditionallyAfterRangeNotSatisfiable() async throws {
+        try await assertInvalidResumeRetriesWithFreshBody(
+            identifier: "range-not-satisfiable",
+            statusCode: 416,
+            responseHeaders: ["Content-Range": "bytes */10"],
+            responseBody: Data()
+        )
+    }
+
+    func testAssetDownloaderRetriesFreshWhenResumeResponseHasWeakETag() async throws {
+        try await assertInvalidResumeRetriesWithFreshBody(
+            identifier: "weak-etag",
+            statusCode: 206,
+            responseHeaders: [
+                "Content-Type": "video/mp4",
+                "ETag": "W/\"fixture-v1\"",
+                "Content-Range": "bytes 5-9/10"
+            ],
+            responseBody: Data("world".utf8)
+        )
+    }
+
+    func testAssetDownloaderRetriesFreshWhenResumeResponseOmitsETag() async throws {
+        try await assertInvalidResumeRetriesWithFreshBody(
+            identifier: "missing-etag",
+            statusCode: 206,
+            responseHeaders: [
+                "Content-Type": "video/mp4",
+                "Content-Range": "bytes 5-9/10"
+            ],
+            responseBody: Data("world".utf8)
+        )
+    }
+
+    func testAssetDownloaderFreshBodyControlSucceedsWithoutResumeHeaders() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+
+        let media = resolvedMedia(for: WebMediaInfo(
+            name: "Fresh body control",
+            src: "https://cdn.example.com/fresh-body-control.mp4",
+            pageSrc: "https://example.com/fresh-body-control",
+            pageTitle: "Fresh body control",
+            mimeType: "video/mp4",
+            duration: 10,
+            detected: true,
+            tagId: "fresh-body-control",
+            isInvisible: false
+        ))
+        let freshBody = Data("fresh-body-control".utf8)
+        let requestLock = NSLock()
+        var requests: [URLRequest] = []
+        URLProtocolStub.handler = { request in
+            requestLock.withLock { requests.append(request) }
+            return (
+                HTTPURLResponse(
+                    url: try XCTUnwrap(request.url),
+                    statusCode: 200,
+                    httpVersion: nil,
+                    headerFields: ["Content-Type": "video/mp4"]
+                )!,
+                freshBody
+            )
+        }
+
+        let artifact = try await WebMediaAssetDownloader(urlSession: makeSession()).download(
+            media: media,
+            into: directory,
+            identifier: "fresh-body-control",
+            onProgress: { _ in }
+        )
+        let observedRequests = requestLock.withLock { requests }
+        XCTAssertEqual(observedRequests.count, 1)
+        XCTAssertNil(observedRequests.first?.value(forHTTPHeaderField: "Range"))
+        XCTAssertNil(observedRequests.first?.value(forHTTPHeaderField: "If-Range"))
+        XCTAssertEqual(artifact.byteCount, Int64(freshBody.count))
+        XCTAssertEqual(
+            try Data(contentsOf: directory.appendingPathComponent(artifact.relativeMediaPath)),
+            freshBody
+        )
+        XCTAssertFalse(FileManager.default.fileExists(atPath: directory.appendingPathComponent("media.partial").path))
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: directory.appendingPathComponent("media.partial.identity.json").path
+        ))
+    }
+
+    private func assertInvalidResumeRetriesWithFreshBody(
+        identifier: String,
+        statusCode: Int,
+        responseHeaders: [String: String],
+        responseBody: Data
+    ) async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+
+        let media = resolvedMedia(for: WebMediaInfo(
+            name: identifier,
+            src: "https://cdn.example.com/\(identifier).mp4",
+            pageSrc: "https://example.com/\(identifier)",
+            pageTitle: identifier,
+            mimeType: "video/mp4",
+            duration: 10,
+            detected: true,
+            tagId: identifier,
+            isInvisible: false
+        ))
+        let partialURL = directory.appendingPathComponent("media.partial")
+        let identityURL = directory.appendingPathComponent("media.partial.identity.json")
+        let savedPrefix = Data("hello".utf8)
+        let unvalidatedTail = Data("world".utf8)
+        let freshBody = Data("fresh-\(identifier)".utf8)
+        try savedPrefix.write(to: partialURL)
+        try writeResumeIdentity(for: media, in: directory)
+
+        let requestLock = NSLock()
+        var requests: [URLRequest] = []
+        var prefixAtFreshRetry: Data?
+        var identityExistsAtFreshRetry: Bool?
+        URLProtocolStub.handler = { request in
+            let requestIndex = requestLock.withLock {
+                requests.append(request)
+                return requests.count
+            }
+            if requestIndex == 1 {
+                return (
+                    HTTPURLResponse(
+                        url: try XCTUnwrap(request.url),
+                        statusCode: statusCode,
+                        httpVersion: nil,
+                        headerFields: responseHeaders
+                    )!,
+                    responseBody
+                )
+            }
+            if requestIndex == 2 {
+                let partialBeforeRetry = try? Data(contentsOf: partialURL)
+                let identityBeforeRetry = FileManager.default.fileExists(atPath: identityURL.path)
+                requestLock.withLock {
+                    prefixAtFreshRetry = partialBeforeRetry
+                    identityExistsAtFreshRetry = identityBeforeRetry
+                }
+            }
+            return (
+                HTTPURLResponse(
+                    url: try XCTUnwrap(request.url),
+                    statusCode: 200,
+                    httpVersion: nil,
+                    headerFields: ["Content-Type": "video/mp4", "ETag": "\"fresh-v1\""]
+                )!,
+                freshBody
+            )
+        }
+
+        let artifact = try await WebMediaAssetDownloader(urlSession: makeSession()).download(
+            media: media,
+            into: directory,
+            identifier: identifier,
+            onProgress: { _ in }
+        )
+        let observedRequests = requestLock.withLock { requests }
+        XCTAssertEqual(observedRequests.count, 2)
+        XCTAssertEqual(observedRequests.first?.value(forHTTPHeaderField: "Range"), "bytes=5-")
+        XCTAssertEqual(observedRequests.first?.value(forHTTPHeaderField: "If-Range"), "\"fixture-v1\"")
+        XCTAssertNil(observedRequests.last?.value(forHTTPHeaderField: "Range"))
+        XCTAssertNil(observedRequests.last?.value(forHTTPHeaderField: "If-Range"))
+        let retrySnapshot = requestLock.withLock { (prefixAtFreshRetry, identityExistsAtFreshRetry) }
+        XCTAssertEqual(retrySnapshot.0, savedPrefix)
+        XCTAssertEqual(retrySnapshot.1, false)
+        XCTAssertEqual(artifact.byteCount, Int64(freshBody.count))
+        let downloadedBody = try Data(contentsOf: directory.appendingPathComponent(artifact.relativeMediaPath))
+        XCTAssertEqual(downloadedBody, freshBody)
+        XCTAssertNotEqual(downloadedBody, savedPrefix + unvalidatedTail)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: partialURL.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: identityURL.path))
+    }
+
     func testUnreadableMetadataPreservesPersistentPayload() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
