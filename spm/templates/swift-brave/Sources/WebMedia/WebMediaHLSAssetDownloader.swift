@@ -5,6 +5,15 @@ import Foundation
 /// One background session survives downloader instances and process launches.
 /// The coordinator persists its task/attempt mapping before starting network I/O.
 public final class WebMediaHLSAssetDownloader: NSObject, WebMediaHLSAssetDownloading, @unchecked Sendable {
+    private let cookieContext: WebMediaHLSCookieContext?
+
+    /// Pass captured browser cookies as scoped cookie objects, never a combined
+    /// Cookie header. Nil preserves the existing caller's header behavior.
+    public init(httpCookies: [HTTPCookie]? = nil) {
+        cookieContext = httpCookies.map(WebMediaHLSCookieContext.init)
+        super.init()
+    }
+
     public static let backgroundSessionIdentifier =
         "\(Bundle.main.bundleIdentifier ?? "com.lakeoffire.swift-brave").webmedia.hls.v1"
 
@@ -15,7 +24,8 @@ public final class WebMediaHLSAssetDownloader: NSObject, WebMediaHLSAssetDownloa
         onProgress: @escaping @Sendable (WebMediaDownloadProgress) -> Void
     ) async throws -> DownloadedWebMediaArtifact {
         try await WebMediaHLSDownloadCoordinator.shared.download(
-            media: media, into: directory, identifier: identifier, onProgress: onProgress
+            media: media, cookieContext: cookieContext, into: directory,
+            identifier: identifier, onProgress: onProgress
         )
     }
 
@@ -108,6 +118,7 @@ private final class WebMediaHLSDownloadCoordinator: NSObject, AVAssetDownloadDel
 
     func download(
         media: ResolvedWebMedia,
+        cookieContext: WebMediaHLSCookieContext?,
         into directory: URL,
         identifier: String,
         onProgress: @escaping @Sendable (WebMediaDownloadProgress) -> Void
@@ -124,7 +135,7 @@ private final class WebMediaHLSDownloadCoordinator: NSObject, AVAssetDownloadDel
                     }
                     do {
                         try self.ensureSession()
-                        let start = { self.startOrAttach(request, media: media, directory: directory, identifier: identifier) }
+                        let start = { self.startOrAttach(request, media: media, cookieContext: cookieContext, directory: directory, identifier: identifier) }
                         if self.reconciling { self.afterReconciliation.append(start) } else { start() }
                     } catch {
                         self.finish(request, with: .failure(error))
@@ -260,20 +271,21 @@ private final class WebMediaHLSDownloadCoordinator: NSObject, AVAssetDownloadDel
         }
     }
 
-    private func startOrAttach(_ request: Request, media: ResolvedWebMedia, directory: URL, identifier: String) {
+    private func startOrAttach(_ request: Request, media: ResolvedWebMedia, cookieContext: WebMediaHLSCookieContext?, directory: URL, identifier: String) {
         guard !request.finished else { return }
         guard !request.cancelled else { finish(request, with: .failure(CancellationError())); return }
         guard session != nil else { finish(request, with: .failure(WebMediaOfflineStoreError.downloadFailed)); return }
         do {
             let destination = WebMediaHLSLocalReference(directory)
             let key = Self.digest(identifier + "\u{1F}" + destination.path)
-            let requestKey = try WebMediaDownloadedArtifactReceipt.requestKey(for: media)
+            let baseRequestKey = try WebMediaDownloadedArtifactReceipt.requestKey(for: media)
+            let requestKey = try cookieContext?.requestKey(base: baseRequestKey) ?? baseRequestKey
             request.key = key
             requests[key, default: [:]][request.id] = request
             if let record = records[key], record.phase == .cancelled {
                 if tasks[key] != nil {
                     afterCancellation[key, default: []].append {
-                        self.startOrAttach(request, media: media, directory: directory, identifier: identifier)
+                        self.startOrAttach(request, media: media, cookieContext: cookieContext, directory: directory, identifier: identifier)
                     }
                     return
                 }
@@ -326,7 +338,9 @@ private final class WebMediaHLSDownloadCoordinator: NSObject, AVAssetDownloadDel
                                 identifier: identifier, destination: destination, requestKey: requestKey,
                                 token: UUID().uuidString, taskIdentifier: nil, phase: .prepared)
             try persist(record)
-            let options = media.requestHeaders.isEmpty ? nil : ["AVURLAssetHTTPHeaderFieldsKey": media.requestHeaders]
+            let options = WebMediaHLSCookieContext.assetOptions(
+                headers: media.requestHeaders, cookieContext: cookieContext
+            )
             let asset = AVURLAsset(url: media.url, options: options)
             guard let task = session?.makeAssetDownloadTask(asset: asset,
                                                             assetTitle: media.mediaInfo.preferredDisplayName,
