@@ -4,6 +4,80 @@ import XCTest
 @testable import WebMedia
 
 final class WebMediaHLSCleanupTests: XCTestCase {
+    func testCancellationJoinsActiveProducerBeforeReturningMissingMetadata() async throws {
+        try await assertCancellationWithLostMetadata(corrupt: false)
+    }
+
+    func testCancellationJoinsActiveProducerBeforeThrowingCorruptMetadata() async throws {
+        try await assertCancellationWithLostMetadata(corrupt: true)
+    }
+
+    private func assertCancellationWithLostMetadata(corrupt: Bool) async throws {
+        let captured = HLSDiscardRecorder()
+        try await WebMediaOfflineStoreTesting.$discardHLSArtifacts.withValue({ captured.record($0) }) {
+            try await withStores { store, _, downloader, _, root, _ in
+                await downloader.holdCancellation()
+                let media = makeMedia()
+                let record = try await store.enqueueDownload(media, storageScope: .transient, thumbnail: .none)
+                try await waitUntil { await downloader.started }
+                let previousDestination = await downloader.destination
+                let metadata = root.appendingPathComponent(record.id).appendingPathComponent("metadata.json")
+                let corruptBytes = Data("{invalid-json".utf8)
+                if corrupt { try corruptBytes.write(to: metadata, options: .atomic) }
+                else { try FileManager.default.removeItem(at: metadata) }
+
+                let completion = HLSCancellationCompletion()
+                let cancellation = Task { () -> Result<WebMediaDownloadRecord?, Error> in
+                    let result: Result<WebMediaDownloadRecord?, Error>
+                    do { result = .success(try await store.cancelDownload(id: record.id)) }
+                    catch { result = .failure(error) }
+                    await completion.markCompleted()
+                    return result
+                }
+                do {
+                    try await waitUntil { await downloader.cancelled }
+                    let returnedBeforeProducerExit = await completion.completed
+                    XCTAssertFalse(returnedBeforeProducerExit)
+                } catch {
+                    await downloader.releaseCancellation()
+                    _ = await cancellation.value
+                    throw error
+                }
+                await downloader.releaseCancellation()
+                let result = await cancellation.value
+                let producerFinished = await downloader.finished
+                XCTAssertTrue(producerFinished)
+                switch result {
+                case .success(let current):
+                    XCTAssertFalse(corrupt, "Corrupt metadata must remain an error after producer shutdown")
+                    XCTAssertNil(current)
+                case .failure(let error):
+                    XCTAssertTrue(corrupt, "Missing metadata should return nil only after joining the producer")
+                    XCTAssertTrue(error is DecodingError)
+                }
+                if corrupt { XCTAssertEqual(try Data(contentsOf: metadata), corruptBytes) }
+                else { XCTAssertFalse(FileManager.default.fileExists(atPath: metadata.path)) }
+
+                // Metadata loss does not authorize guessed reconstruction.
+                // Explicitly remove this store's damaged slot before a fresh
+                // same-resource attempt; old task teardown cannot retire it.
+                try await store.deleteStoredMedia(id: record.id)
+                await downloader.prepareForNextAttempt()
+                let replacement = try await store.enqueueDownload(media, storageScope: .transient, thumbnail: .none)
+                XCTAssertEqual(replacement.id, record.id)
+                try await waitUntil { await downloader.started }
+                let replacementDestination = await downloader.destination
+                XCTAssertNotEqual(replacementDestination, previousDestination)
+                let replacementIsDownloading = try await store.isDownloading(id: replacement.id)
+                XCTAssertTrue(replacementIsDownloading)
+                let cancelledReplacement = try await store.cancelDownload(id: replacement.id)
+                XCTAssertEqual(cancelledReplacement?.state, .cancelled)
+                let replacementFinished = await downloader.finished
+                XCTAssertTrue(replacementFinished)
+            }
+        }
+    }
+
     func testDeletingPrivateStorePreservesSameResourceTransferInAnotherStore() async throws {
         let captured = HLSDiscardRecorder()
         try await WebMediaOfflineStoreTesting.$discardHLSArtifacts.withValue({ captured.record($0) }) {
@@ -138,17 +212,22 @@ final class WebMediaHLSCleanupTests: XCTestCase {
         do {
             try await operation(first, second, firstDownloader, secondDownloader, firstRoot, secondRoot)
         } catch {
-            await cleanup(first)
-            await cleanup(second)
+            await cleanup(first, downloader: firstDownloader)
+            await cleanup(second, downloader: secondDownloader)
             try? FileManager.default.removeItem(at: root)
             throw error
         }
-        await cleanup(first)
-        await cleanup(second)
+        await cleanup(first, downloader: firstDownloader)
+        await cleanup(second, downloader: secondDownloader)
         try? FileManager.default.removeItem(at: root)
     }
 
-    private func cleanup(_ store: WebMediaOfflineStore) async {
+    private func cleanup(_ store: WebMediaOfflineStore, downloader: SuspendedHLSTestDownloader) async {
+        await downloader.releaseCancellation()
+        if let identifier = await downloader.identifier {
+            _ = try? await store.cancelDownload(id: identifier)
+            try? await store.deleteStoredMedia(id: identifier)
+        }
         for record in (try? await store.allDownloadRecords()) ?? [] {
             _ = try? await store.cancelDownload(id: record.id)
             try? await store.deleteStoredMedia(id: record.id)
@@ -175,17 +254,48 @@ private actor SuspendedHLSTestDownloader: WebMediaArtifactDownloading {
     private(set) var started = false
     private(set) var cancelled = false
     private(set) var destination: URL?
+    private(set) var identifier: String?
+    private(set) var finished = false
+    private var cancellationReleased = true
+    private var cancellationWaiters: [CheckedContinuation<Void, Never>] = []
+
+    func holdCancellation() { cancellationReleased = false }
+
+    func releaseCancellation() {
+        cancellationReleased = true
+        let waiters = cancellationWaiters
+        cancellationWaiters.removeAll()
+        for waiter in waiters { waiter.resume() }
+    }
+
+    func prepareForNextAttempt() {
+        started = false
+        cancelled = false
+        finished = false
+        destination = nil
+        identifier = nil
+    }
 
     func download(media: ResolvedWebMedia, into directory: URL, identifier: String,
                   onProgress: @escaping @Sendable (WebMediaDownloadProgress) -> Void) async throws -> DownloadedWebMediaArtifact {
         destination = directory
+        self.identifier = identifier
         started = true
         do {
             try await Task.sleep(for: .seconds(60))
             throw URLError(.timedOut)
         } catch {
             cancelled = Task.isCancelled
+            if !cancellationReleased {
+                await withCheckedContinuation { cancellationWaiters.append($0) }
+            }
+            finished = true
             throw error
         }
     }
+}
+
+private actor HLSCancellationCompletion {
+    private(set) var completed = false
+    func markCompleted() { completed = true }
 }

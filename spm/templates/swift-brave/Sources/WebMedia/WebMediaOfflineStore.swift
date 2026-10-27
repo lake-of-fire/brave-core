@@ -1136,14 +1136,18 @@ public actor WebMediaOfflineStore {
     }
 
     public func cancelDownload(id: String) async throws -> WebMediaDownloadRecord? {
-        guard let metadata = try loadMetadata(id: id) else {
-            return nil
-        }
-
+        // The in-memory attempt is sufficient authority to stop its producer.
+        // Missing/corrupt metadata must not bypass cancellation or its join.
         if let activeDownload = activeDownloads[id] {
             activeDownload.task.cancel()
             _ = await activeDownload.task.value
-        } else if metadata.state == .queued || metadata.state == .downloading {
+            return try currentDownloadRecord(id: id)
+        }
+
+        guard let metadata = try loadMetadata(id: id) else {
+            return nil
+        }
+        if metadata.state == .queued || metadata.state == .downloading {
             markDownloadCancelled(identifier: id)
         }
 
