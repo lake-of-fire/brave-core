@@ -21,10 +21,24 @@ final class WebMediaHLSCleanupTests: XCTestCase {
                 let record = try await store.enqueueDownload(media, storageScope: .transient, thumbnail: .none)
                 try await waitUntil { await downloader.started }
                 let previousDestination = await downloader.destination
-                let metadata = root.appendingPathComponent(record.id).appendingPathComponent("metadata.json")
+                let itemDirectory = root.appendingPathComponent(record.id)
+                let metadata = itemDirectory.appendingPathComponent("metadata.json")
                 let corruptBytes = Data("{invalid-json".utf8)
-                if corrupt { try corruptBytes.write(to: metadata, options: .atomic) }
-                else { try FileManager.default.removeItem(at: metadata) }
+                if corrupt {
+                    // The store deliberately recovers from previous/committed
+                    // metadata. Corrupt every existing representation so this
+                    // fixture actually exercises an unreadable active record.
+                    for name in ["metadata.json", ".metadata.previous.json", ".committed-media.json", ".download-commit.json"] {
+                        let file = itemDirectory.appendingPathComponent(name)
+                        if FileManager.default.fileExists(atPath: file.path) {
+                            try corruptBytes.write(to: file, options: .atomic)
+                        }
+                    }
+                } else {
+                    // Missing item metadata means no item directory; a lone
+                    // missing metadata.json is still eligible for recovery.
+                    try FileManager.default.removeItem(at: itemDirectory)
+                }
 
                 let completion = HLSCancellationCompletion()
                 let cancellation = Task { () -> Result<WebMediaDownloadRecord?, Error> in
