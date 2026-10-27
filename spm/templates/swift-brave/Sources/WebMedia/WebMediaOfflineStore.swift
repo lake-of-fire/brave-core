@@ -7,6 +7,7 @@ import UniformTypeIdentifiers
 enum WebMediaOfflineStoreTesting {
     @TaskLocal static var downloadWaiterDidRegister: (@Sendable () -> Void)? = nil
     @TaskLocal static var beforeThumbnailPublication: (@Sendable () async -> Void)? = nil
+    @TaskLocal static var discardHLSArtifacts: (@Sendable (WebMediaHLSDiscardScope) -> Void)? = nil
 }
 
 public enum WebMediaOfflineStorageScope: String, Codable, CaseIterable, Sendable {
@@ -1346,7 +1347,9 @@ public actor WebMediaOfflineStore {
         thumbnailAttempts.removeValue(forKey: id)
         activeDownloads.removeValue(forKey: id)?.task.cancel()
         finishWaiters(id: id, result: .failure(WebMediaOfflineStoreError.downloadCancelled))
-        WebMediaHLSAssetDownloader.discardArtifacts(identifier: id)
+        WebMediaHLSAssetDownloader.discardArtifacts(
+            identifier: id, within: WebMediaOfflineStorageScope.allCases.map { rootURL(for: $0) }
+        )
         for scope in WebMediaOfflineStorageScope.allCases {
             try WebMediaNativeHLSAssets.removeCompletedReferences(in: directoryURL(for: id, scope: scope), identifier: id)
             try deleteDirectoryIfPresent(directoryURL(for: id, scope: scope))
@@ -1381,13 +1384,13 @@ public actor WebMediaOfflineStore {
                     // HLS task remains bound to an older staging scope.
                     for attemptRoot in try FileManager.default.contentsOfDirectory(at: entry, includingPropertiesForKeys: nil)
                         where !protected.contains(attemptRoot.lastPathComponent) {
-                        WebMediaHLSAssetDownloader.discardArtifacts(identifier: attemptRoot.lastPathComponent)
+                        WebMediaHLSAssetDownloader.discardArtifacts(identifier: attemptRoot.lastPathComponent, within: [root])
                         try deleteDirectoryIfPresent(attemptRoot)
                     }
                 } else if !protected.contains(entry.lastPathComponent) {
                     if Self.isSafeIdentifier(entry.lastPathComponent),
                        (try? entry.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true {
-                        WebMediaHLSAssetDownloader.discardArtifacts(identifier: entry.lastPathComponent)
+                        WebMediaHLSAssetDownloader.discardArtifacts(identifier: entry.lastPathComponent, within: [root])
                         try WebMediaNativeHLSAssets.removeCompletedReferences(in: entry, identifier: entry.lastPathComponent)
                     }
                     try deleteDirectoryIfPresent(entry)

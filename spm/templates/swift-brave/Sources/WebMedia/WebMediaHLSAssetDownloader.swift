@@ -49,8 +49,31 @@ public final class WebMediaHLSAssetDownloader: NSObject, WebMediaHLSAssetDownloa
         WebMediaHLSDownloadCoordinator.shared.acknowledgeArtifact(in: directory)
     }
 
-    static func discardArtifacts(identifier: String) {
-        WebMediaHLSDownloadCoordinator.shared.discardArtifacts(identifier: identifier)
+    static func discardArtifacts(identifier: String, within rootDirectories: [URL]) {
+        let scope = WebMediaHLSDiscardScope(identifier: identifier, rootDirectories: rootDirectories)
+        if let discard = WebMediaOfflineStoreTesting.discardHLSArtifacts {
+            discard(scope)
+            return
+        }
+        WebMediaHLSDownloadCoordinator.shared.discardArtifacts(scope: scope)
+    }
+}
+
+/// Media identifiers are resource identities shared by independent stores.
+/// Only destinations inside the deleting store's roots authorize retirement.
+struct WebMediaHLSDiscardScope: Sendable {
+    let identifier: String
+    let rootDirectories: [URL]
+
+    init(identifier: String, rootDirectories: [URL]) {
+        self.identifier = identifier
+        self.rootDirectories = rootDirectories.map { $0.standardizedFileURL.resolvingSymlinksInPath() }
+    }
+
+    func contains(identifier: String, destination: WebMediaHLSLocalReference) -> Bool {
+        guard self.identifier == identifier else { return false }
+        let components = destination.url.standardizedFileURL.resolvingSymlinksInPath().pathComponents
+        return rootDirectories.contains { components.starts(with: $0.pathComponents) }
     }
 }
 
@@ -175,11 +198,11 @@ private final class WebMediaHLSDownloadCoordinator: NSObject, AVAssetDownloadDel
         }
     }
 
-    func discardArtifacts(identifier: String) {
+    func discardArtifacts(scope: WebMediaHLSDiscardScope) {
         stateQueue.async {
             do {
                 try self.ensureSession()
-                let discard = { self.discardOwnedTransfers(identifier: identifier) }
+                let discard = { self.discardOwnedTransfers(scope: scope) }
                 if self.reconciling { self.afterReconciliation.append(discard) } else { discard() }
             } catch {
                 // Leave both journal and asset intact if ownership cannot be
@@ -188,8 +211,8 @@ private final class WebMediaHLSDownloadCoordinator: NSObject, AVAssetDownloadDel
         }
     }
 
-    private func discardOwnedTransfers(identifier: String) {
-        for (key, var record) in records where record.identifier == identifier {
+    private func discardOwnedTransfers(scope: WebMediaHLSDiscardScope) {
+        for (key, var record) in records where scope.contains(identifier: record.identifier, destination: record.destination) {
             finishRequests(key, with: .failure(CancellationError()))
             if let task = tasks[key] {
                 record.phase = .cancelled
@@ -198,7 +221,7 @@ private final class WebMediaHLSDownloadCoordinator: NSObject, AVAssetDownloadDel
                 task.cancel()
             } else {
                 do {
-                    try WebMediaNativeHLSAssets.remove(identifier: identifier, transferIdentifier: record.token)
+                    try WebMediaNativeHLSAssets.remove(identifier: record.identifier, transferIdentifier: record.token)
                     records.removeValue(forKey: key)
                     try? FileManager.default.removeItem(at: manifestURL(for: key))
                 } catch { }
