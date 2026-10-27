@@ -5,6 +5,15 @@ import Foundation
 /// One background session survives downloader instances and process launches.
 /// The coordinator persists its task/attempt mapping before starting network I/O.
 public final class WebMediaHLSAssetDownloader: NSObject, WebMediaHLSAssetDownloading, @unchecked Sendable {
+    private let cookieContext: WebMediaHLSCookieContext?
+
+    /// Pass captured browser cookies as scoped cookie objects, never a combined
+    /// Cookie header. Nil preserves the existing caller's header behavior.
+    public init(httpCookies: [HTTPCookie]? = nil) {
+        cookieContext = httpCookies.map(WebMediaHLSCookieContext.init)
+        super.init()
+    }
+
     public static let backgroundSessionIdentifier =
         "\(Bundle.main.bundleIdentifier ?? "com.lakeoffire.swift-brave").webmedia.hls.v1"
 
@@ -15,7 +24,8 @@ public final class WebMediaHLSAssetDownloader: NSObject, WebMediaHLSAssetDownloa
         onProgress: @escaping @Sendable (WebMediaDownloadProgress) -> Void
     ) async throws -> DownloadedWebMediaArtifact {
         try await WebMediaHLSDownloadCoordinator.shared.download(
-            media: media, into: directory, identifier: identifier, onProgress: onProgress
+            media: media, cookieContext: cookieContext, into: directory,
+            identifier: identifier, onProgress: onProgress
         )
     }
 
@@ -39,8 +49,31 @@ public final class WebMediaHLSAssetDownloader: NSObject, WebMediaHLSAssetDownloa
         WebMediaHLSDownloadCoordinator.shared.acknowledgeArtifact(in: directory)
     }
 
-    static func discardArtifacts(identifier: String) {
-        WebMediaHLSDownloadCoordinator.shared.discardArtifacts(identifier: identifier)
+    static func discardArtifacts(identifier: String, within rootDirectories: [URL]) {
+        let scope = WebMediaHLSDiscardScope(identifier: identifier, rootDirectories: rootDirectories)
+        if let discard = WebMediaOfflineStoreTesting.discardHLSArtifacts {
+            discard(scope)
+            return
+        }
+        WebMediaHLSDownloadCoordinator.shared.discardArtifacts(scope: scope)
+    }
+}
+
+/// Media identifiers are resource identities shared by independent stores.
+/// Only destinations inside the deleting store's roots authorize retirement.
+struct WebMediaHLSDiscardScope: Sendable {
+    let identifier: String
+    let rootDirectories: [URL]
+
+    init(identifier: String, rootDirectories: [URL]) {
+        self.identifier = identifier
+        self.rootDirectories = rootDirectories.map { $0.standardizedFileURL.resolvingSymlinksInPath() }
+    }
+
+    func contains(identifier: String, destination: WebMediaHLSLocalReference) -> Bool {
+        guard self.identifier == identifier else { return false }
+        let components = destination.url.standardizedFileURL.resolvingSymlinksInPath().pathComponents
+        return rootDirectories.contains { components.starts(with: $0.pathComponents) }
     }
 }
 
@@ -73,6 +106,7 @@ private final class WebMediaHLSDownloadCoordinator: NSObject, AVAssetDownloadDel
         let identifier: String
         let destination: WebMediaHLSLocalReference
         let requestKey: String
+        var baseRequestKey: String? = nil
         var token: String
         var taskIdentifier: Int?
         var phase: Phase
@@ -108,6 +142,7 @@ private final class WebMediaHLSDownloadCoordinator: NSObject, AVAssetDownloadDel
 
     func download(
         media: ResolvedWebMedia,
+        cookieContext: WebMediaHLSCookieContext?,
         into directory: URL,
         identifier: String,
         onProgress: @escaping @Sendable (WebMediaDownloadProgress) -> Void
@@ -124,7 +159,7 @@ private final class WebMediaHLSDownloadCoordinator: NSObject, AVAssetDownloadDel
                     }
                     do {
                         try self.ensureSession()
-                        let start = { self.startOrAttach(request, media: media, directory: directory, identifier: identifier) }
+                        let start = { self.startOrAttach(request, media: media, cookieContext: cookieContext, directory: directory, identifier: identifier) }
                         if self.reconciling { self.afterReconciliation.append(start) } else { start() }
                     } catch {
                         self.finish(request, with: .failure(error))
@@ -164,11 +199,11 @@ private final class WebMediaHLSDownloadCoordinator: NSObject, AVAssetDownloadDel
         }
     }
 
-    func discardArtifacts(identifier: String) {
+    func discardArtifacts(scope: WebMediaHLSDiscardScope) {
         stateQueue.async {
             do {
                 try self.ensureSession()
-                let discard = { self.discardOwnedTransfers(identifier: identifier) }
+                let discard = { self.discardOwnedTransfers(scope: scope) }
                 if self.reconciling { self.afterReconciliation.append(discard) } else { discard() }
             } catch {
                 // Leave both journal and asset intact if ownership cannot be
@@ -177,8 +212,8 @@ private final class WebMediaHLSDownloadCoordinator: NSObject, AVAssetDownloadDel
         }
     }
 
-    private func discardOwnedTransfers(identifier: String) {
-        for (key, var record) in records where record.identifier == identifier {
+    private func discardOwnedTransfers(scope: WebMediaHLSDiscardScope) {
+        for (key, var record) in records where scope.contains(identifier: record.identifier, destination: record.destination) {
             finishRequests(key, with: .failure(CancellationError()))
             if let task = tasks[key] {
                 record.phase = .cancelled
@@ -187,7 +222,7 @@ private final class WebMediaHLSDownloadCoordinator: NSObject, AVAssetDownloadDel
                 task.cancel()
             } else {
                 do {
-                    try WebMediaNativeHLSAssets.remove(identifier: identifier, transferIdentifier: record.token)
+                    try WebMediaNativeHLSAssets.remove(identifier: record.identifier, transferIdentifier: record.token)
                     records.removeValue(forKey: key)
                     try? FileManager.default.removeItem(at: manifestURL(for: key))
                 } catch { }
@@ -260,20 +295,21 @@ private final class WebMediaHLSDownloadCoordinator: NSObject, AVAssetDownloadDel
         }
     }
 
-    private func startOrAttach(_ request: Request, media: ResolvedWebMedia, directory: URL, identifier: String) {
+    private func startOrAttach(_ request: Request, media: ResolvedWebMedia, cookieContext: WebMediaHLSCookieContext?, directory: URL, identifier: String) {
         guard !request.finished else { return }
         guard !request.cancelled else { finish(request, with: .failure(CancellationError())); return }
         guard session != nil else { finish(request, with: .failure(WebMediaOfflineStoreError.downloadFailed)); return }
         do {
             let destination = WebMediaHLSLocalReference(directory)
             let key = Self.digest(identifier + "\u{1F}" + destination.path)
-            let requestKey = try WebMediaDownloadedArtifactReceipt.requestKey(for: media)
+            let baseRequestKey = try WebMediaDownloadedArtifactReceipt.requestKey(for: media)
+            let requestKey = try cookieContext?.requestKey(base: baseRequestKey) ?? baseRequestKey
             request.key = key
             requests[key, default: [:]][request.id] = request
             if let record = records[key], record.phase == .cancelled {
                 if tasks[key] != nil {
                     afterCancellation[key, default: []].append {
-                        self.startOrAttach(request, media: media, directory: directory, identifier: identifier)
+                        self.startOrAttach(request, media: media, cookieContext: cookieContext, directory: directory, identifier: identifier)
                     }
                     return
                 }
@@ -324,9 +360,11 @@ private final class WebMediaHLSDownloadCoordinator: NSObject, AVAssetDownloadDel
             var record = Record(key: key,
                                 sessionIdentifier: WebMediaHLSAssetDownloader.backgroundSessionIdentifier,
                                 identifier: identifier, destination: destination, requestKey: requestKey,
-                                token: UUID().uuidString, taskIdentifier: nil, phase: .prepared)
+                                baseRequestKey: baseRequestKey, token: UUID().uuidString, taskIdentifier: nil, phase: .prepared)
             try persist(record)
-            let options = media.requestHeaders.isEmpty ? nil : ["AVURLAssetHTTPHeaderFieldsKey": media.requestHeaders]
+            let options = WebMediaHLSCookieContext.assetOptions(
+                headers: media.requestHeaders, cookieContext: cookieContext
+            )
             let asset = AVURLAsset(url: media.url, options: options)
             guard let task = session?.makeAssetDownloadTask(asset: asset,
                                                             assetTitle: media.mediaInfo.preferredDisplayName,
@@ -499,9 +537,11 @@ private final class WebMediaHLSDownloadCoordinator: NSObject, AVAssetDownloadDel
         completed.phase = .published
         completed.artifact = artifact
         try persist(completed)
-        // The store can finish a download even if the process died after this
-        // callback and before its suspended continuation resumed.
-        try JSONEncoder().encode(WebMediaDownloadedArtifactReceipt(artifact: artifact, requestKey: record.requestKey))
+        // Recovery must return through this coordinator's context-aware key,
+        // even if the process dies before its continuation resumes.
+        try JSONEncoder().encode(WebMediaDownloadedArtifactReceipt(
+            artifact: artifact, requestKey: record.requestKey, recoveryOwner: .downloader,
+            baseRequestKey: record.baseRequestKey))
             .write(to: directory.appendingPathComponent(".downloaded-artifact.json"), options: .atomic)
         let progress = WebMediaDownloadProgress(id: record.identifier, fractionCompleted: 1,
                                                  bytesDownloaded: byteCount, totalBytesExpected: byteCount)

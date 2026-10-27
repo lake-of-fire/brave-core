@@ -5,8 +5,10 @@ import ImageIO
 import UniformTypeIdentifiers
 
 enum WebMediaOfflineStoreTesting {
+    @TaskLocal static var afterDownloadedArtifact: (@Sendable () async throws -> Void)? = nil
     @TaskLocal static var downloadWaiterDidRegister: (@Sendable () -> Void)? = nil
     @TaskLocal static var beforeThumbnailPublication: (@Sendable () async -> Void)? = nil
+    @TaskLocal static var discardHLSArtifacts: (@Sendable (WebMediaHLSDiscardScope) -> Void)? = nil
 }
 
 public enum WebMediaOfflineStorageScope: String, Codable, CaseIterable, Sendable {
@@ -427,6 +429,17 @@ public struct DownloadedWebMediaArtifact: Codable, Hashable, Sendable {
 struct WebMediaDownloadedArtifactReceipt: Codable {
     let artifact: DownloadedWebMediaArtifact
     let requestKey: String
+    enum RecoveryOwner: String, Codable { case downloader }
+    var recoveryOwner: RecoveryOwner? = nil
+    // Routing evidence only; the downloader still checks its stronger key.
+    var baseRequestKey: String? = nil
+
+    // Native HLS references predate the explicit owner field. Even receipts
+    // previously downgraded by Store must return to the HLS identity owner.
+    var requiresDownloaderValidation: Bool {
+        recoveryOwner == .downloader
+            || (artifact.relativeMediaPath as NSString).pathExtension.lowercased() == "hlsref"
+    }
 
     static func requestKey(for media: ResolvedWebMedia) throws -> String {
         let encoder = JSONEncoder()
@@ -509,9 +522,23 @@ public final class WebMediaAssetDownloader: WebMediaArtifactDownloading, @unchec
                 throw error
             }
         }
-        if media.containerKind == .hls {
+        let retainedReceipt = (try? Data(contentsOf: directory.appendingPathComponent(".downloaded-artifact.json"))).flatMap {
+            try? JSONDecoder().decode(WebMediaDownloadedArtifactReceipt.self, from: $0)
+        }
+        let currentBaseKey = try WebMediaDownloadedArtifactReceipt.requestKey(for: media)
+        let retainedNativeHLS = retainedReceipt.map {
+            ($0.artifact.relativeMediaPath as NSString).pathExtension.lowercased() == "hlsref"
+                && ($0.baseRequestKey == currentBaseKey || $0.requestKey == currentBaseKey)
+        } ?? false
+        if media.containerKind == .hls || retainedNativeHLS {
+            // An HTTP-sniffed HLS response has generic original metadata.
+            // Delegate recovery directly; only HLS may validate its retained
+            // journal/context, without requiring another HTTP probe first.
+            let hlsMedia = ResolvedWebMedia(mediaInfo: media.mediaInfo, url: media.url,
+                mimeType: "application/vnd.apple.mpegurl", requestHeaders: media.requestHeaders,
+                resolutionMethod: media.resolutionMethod)
             return try await hlsDownloaderFactory().download(
-                media: media,
+                media: hlsMedia,
                 into: directory,
                 identifier: identifier,
                 onProgress: onProgress
@@ -1135,14 +1162,18 @@ public actor WebMediaOfflineStore {
     }
 
     public func cancelDownload(id: String) async throws -> WebMediaDownloadRecord? {
-        guard let metadata = try loadMetadata(id: id) else {
-            return nil
-        }
-
+        // The in-memory attempt is sufficient authority to stop its producer.
+        // Missing/corrupt metadata must not bypass cancellation or its join.
         if let activeDownload = activeDownloads[id] {
             activeDownload.task.cancel()
             _ = await activeDownload.task.value
-        } else if metadata.state == .queued || metadata.state == .downloading {
+            return try currentDownloadRecord(id: id)
+        }
+
+        guard let metadata = try loadMetadata(id: id) else {
+            return nil
+        }
+        if metadata.state == .queued || metadata.state == .downloading {
             markDownloadCancelled(identifier: id)
         }
 
@@ -1346,7 +1377,9 @@ public actor WebMediaOfflineStore {
         thumbnailAttempts.removeValue(forKey: id)
         activeDownloads.removeValue(forKey: id)?.task.cancel()
         finishWaiters(id: id, result: .failure(WebMediaOfflineStoreError.downloadCancelled))
-        WebMediaHLSAssetDownloader.discardArtifacts(identifier: id)
+        WebMediaHLSAssetDownloader.discardArtifacts(
+            identifier: id, within: WebMediaOfflineStorageScope.allCases.map { rootURL(for: $0) }
+        )
         for scope in WebMediaOfflineStorageScope.allCases {
             try WebMediaNativeHLSAssets.removeCompletedReferences(in: directoryURL(for: id, scope: scope), identifier: id)
             try deleteDirectoryIfPresent(directoryURL(for: id, scope: scope))
@@ -1381,13 +1414,13 @@ public actor WebMediaOfflineStore {
                     // HLS task remains bound to an older staging scope.
                     for attemptRoot in try FileManager.default.contentsOfDirectory(at: entry, includingPropertiesForKeys: nil)
                         where !protected.contains(attemptRoot.lastPathComponent) {
-                        WebMediaHLSAssetDownloader.discardArtifacts(identifier: attemptRoot.lastPathComponent)
+                        WebMediaHLSAssetDownloader.discardArtifacts(identifier: attemptRoot.lastPathComponent, within: [root])
                         try deleteDirectoryIfPresent(attemptRoot)
                     }
                 } else if !protected.contains(entry.lastPathComponent) {
                     if Self.isSafeIdentifier(entry.lastPathComponent),
                        (try? entry.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true {
-                        WebMediaHLSAssetDownloader.discardArtifacts(identifier: entry.lastPathComponent)
+                        WebMediaHLSAssetDownloader.discardArtifacts(identifier: entry.lastPathComponent, within: [root])
                         try WebMediaNativeHLSAssets.removeCompletedReferences(in: entry, identifier: entry.lastPathComponent)
                     }
                     try deleteDirectoryIfPresent(entry)
@@ -1699,6 +1732,7 @@ public actor WebMediaOfflineStore {
             let artifactRequestKey = try WebMediaDownloadedArtifactReceipt.requestKey(for: resolvedMedia)
             if let data = try? Data(contentsOf: artifactReceipt),
                let saved = try? JSONDecoder().decode(WebMediaDownloadedArtifactReceipt.self, from: data),
+               !saved.requiresDownloaderValidation,
                saved.requestKey == artifactRequestKey,
                StoredWebMediaFileSystem.validatedPayloadURL(relativePath: saved.artifact.relativeMediaPath,
                                                             rootDirectory: stagingDirectory,
@@ -1720,10 +1754,21 @@ public actor WebMediaOfflineStore {
                         }
                     }
                 )
-                try JSONEncoder().encode(WebMediaDownloadedArtifactReceipt(artifact: artifact, requestKey: artifactRequestKey))
-                    .write(to: artifactReceipt, options: .atomic)
+                // Downloader-owned receipts carry transport-specific authority
+                // (HLS includes captured credentials). Never replace that key
+                // with Store's weaker media/URL/header key.
+                let publishedReceipt = (try? Data(contentsOf: artifactReceipt)).flatMap {
+                    try? JSONDecoder().decode(WebMediaDownloadedArtifactReceipt.self, from: $0)
+                }
+                let nativeHLS = (artifact.relativeMediaPath as NSString).pathExtension.lowercased() == "hlsref"
+                if !nativeHLS && !(publishedReceipt?.artifact == artifact
+                    && publishedReceipt?.requiresDownloaderValidation == true) {
+                    try JSONEncoder().encode(WebMediaDownloadedArtifactReceipt(artifact: artifact, requestKey: artifactRequestKey))
+                        .write(to: artifactReceipt, options: .atomic)
+                }
             }
 
+            try await WebMediaOfflineStoreTesting.afterDownloadedArtifact?()
             try Task.checkCancellation()
 
             guard isCurrentDownloadAttempt(identifier: identifier, attemptID: attemptID),
