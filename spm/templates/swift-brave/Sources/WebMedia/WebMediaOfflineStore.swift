@@ -5,6 +5,7 @@ import ImageIO
 import UniformTypeIdentifiers
 
 enum WebMediaOfflineStoreTesting {
+    @TaskLocal static var afterDownloadedArtifact: (@Sendable () async throws -> Void)? = nil
     @TaskLocal static var downloadWaiterDidRegister: (@Sendable () -> Void)? = nil
     @TaskLocal static var beforeThumbnailPublication: (@Sendable () async -> Void)? = nil
     @TaskLocal static var discardHLSArtifacts: (@Sendable (WebMediaHLSDiscardScope) -> Void)? = nil
@@ -428,6 +429,17 @@ public struct DownloadedWebMediaArtifact: Codable, Hashable, Sendable {
 struct WebMediaDownloadedArtifactReceipt: Codable {
     let artifact: DownloadedWebMediaArtifact
     let requestKey: String
+    enum RecoveryOwner: String, Codable { case downloader }
+    var recoveryOwner: RecoveryOwner? = nil
+    // Routing evidence only; the downloader still checks its stronger key.
+    var baseRequestKey: String? = nil
+
+    // Native HLS references predate the explicit owner field. Even receipts
+    // previously downgraded by Store must return to the HLS identity owner.
+    var requiresDownloaderValidation: Bool {
+        recoveryOwner == .downloader
+            || (artifact.relativeMediaPath as NSString).pathExtension.lowercased() == "hlsref"
+    }
 
     static func requestKey(for media: ResolvedWebMedia) throws -> String {
         let encoder = JSONEncoder()
@@ -510,9 +522,23 @@ public final class WebMediaAssetDownloader: WebMediaArtifactDownloading, @unchec
                 throw error
             }
         }
-        if media.containerKind == .hls {
+        let retainedReceipt = (try? Data(contentsOf: directory.appendingPathComponent(".downloaded-artifact.json"))).flatMap {
+            try? JSONDecoder().decode(WebMediaDownloadedArtifactReceipt.self, from: $0)
+        }
+        let currentBaseKey = try WebMediaDownloadedArtifactReceipt.requestKey(for: media)
+        let retainedNativeHLS = retainedReceipt.map {
+            ($0.artifact.relativeMediaPath as NSString).pathExtension.lowercased() == "hlsref"
+                && ($0.baseRequestKey == currentBaseKey || $0.requestKey == currentBaseKey)
+        } ?? false
+        if media.containerKind == .hls || retainedNativeHLS {
+            // An HTTP-sniffed HLS response has generic original metadata.
+            // Delegate recovery directly; only HLS may validate its retained
+            // journal/context, without requiring another HTTP probe first.
+            let hlsMedia = ResolvedWebMedia(mediaInfo: media.mediaInfo, url: media.url,
+                mimeType: "application/vnd.apple.mpegurl", requestHeaders: media.requestHeaders,
+                resolutionMethod: media.resolutionMethod)
             return try await hlsDownloaderFactory().download(
-                media: media,
+                media: hlsMedia,
                 into: directory,
                 identifier: identifier,
                 onProgress: onProgress
@@ -1706,6 +1732,7 @@ public actor WebMediaOfflineStore {
             let artifactRequestKey = try WebMediaDownloadedArtifactReceipt.requestKey(for: resolvedMedia)
             if let data = try? Data(contentsOf: artifactReceipt),
                let saved = try? JSONDecoder().decode(WebMediaDownloadedArtifactReceipt.self, from: data),
+               !saved.requiresDownloaderValidation,
                saved.requestKey == artifactRequestKey,
                StoredWebMediaFileSystem.validatedPayloadURL(relativePath: saved.artifact.relativeMediaPath,
                                                             rootDirectory: stagingDirectory,
@@ -1727,10 +1754,21 @@ public actor WebMediaOfflineStore {
                         }
                     }
                 )
-                try JSONEncoder().encode(WebMediaDownloadedArtifactReceipt(artifact: artifact, requestKey: artifactRequestKey))
-                    .write(to: artifactReceipt, options: .atomic)
+                // Downloader-owned receipts carry transport-specific authority
+                // (HLS includes captured credentials). Never replace that key
+                // with Store's weaker media/URL/header key.
+                let publishedReceipt = (try? Data(contentsOf: artifactReceipt)).flatMap {
+                    try? JSONDecoder().decode(WebMediaDownloadedArtifactReceipt.self, from: $0)
+                }
+                let nativeHLS = (artifact.relativeMediaPath as NSString).pathExtension.lowercased() == "hlsref"
+                if !nativeHLS && !(publishedReceipt?.artifact == artifact
+                    && publishedReceipt?.requiresDownloaderValidation == true) {
+                    try JSONEncoder().encode(WebMediaDownloadedArtifactReceipt(artifact: artifact, requestKey: artifactRequestKey))
+                        .write(to: artifactReceipt, options: .atomic)
+                }
             }
 
+            try await WebMediaOfflineStoreTesting.afterDownloadedArtifact?()
             try Task.checkCancellation()
 
             guard isCurrentDownloadAttempt(identifier: identifier, attemptID: attemptID),

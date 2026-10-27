@@ -106,6 +106,7 @@ private final class WebMediaHLSDownloadCoordinator: NSObject, AVAssetDownloadDel
         let identifier: String
         let destination: WebMediaHLSLocalReference
         let requestKey: String
+        var baseRequestKey: String? = nil
         var token: String
         var taskIdentifier: Int?
         var phase: Phase
@@ -359,7 +360,7 @@ private final class WebMediaHLSDownloadCoordinator: NSObject, AVAssetDownloadDel
             var record = Record(key: key,
                                 sessionIdentifier: WebMediaHLSAssetDownloader.backgroundSessionIdentifier,
                                 identifier: identifier, destination: destination, requestKey: requestKey,
-                                token: UUID().uuidString, taskIdentifier: nil, phase: .prepared)
+                                baseRequestKey: baseRequestKey, token: UUID().uuidString, taskIdentifier: nil, phase: .prepared)
             try persist(record)
             let options = WebMediaHLSCookieContext.assetOptions(
                 headers: media.requestHeaders, cookieContext: cookieContext
@@ -536,9 +537,11 @@ private final class WebMediaHLSDownloadCoordinator: NSObject, AVAssetDownloadDel
         completed.phase = .published
         completed.artifact = artifact
         try persist(completed)
-        // The store can finish a download even if the process died after this
-        // callback and before its suspended continuation resumed.
-        try JSONEncoder().encode(WebMediaDownloadedArtifactReceipt(artifact: artifact, requestKey: record.requestKey))
+        // Recovery must return through this coordinator's context-aware key,
+        // even if the process dies before its continuation resumes.
+        try JSONEncoder().encode(WebMediaDownloadedArtifactReceipt(
+            artifact: artifact, requestKey: record.requestKey, recoveryOwner: .downloader,
+            baseRequestKey: record.baseRequestKey))
             .write(to: directory.appendingPathComponent(".downloaded-artifact.json"), options: .atomic)
         let progress = WebMediaDownloadProgress(id: record.identifier, fractionCompleted: 1,
                                                  bytesDownloaded: byteCount, totalBytesExpected: byteCount)
