@@ -40,12 +40,42 @@ public enum AdblockRulesStoreError: Error {
     case invalidRulesData
 }
 
+extension AdblockRulesStoreError: LocalizedError {
+    public var errorDescription: String? {
+        switch self {
+        case .invalidResponse:
+            return "Invalid response when downloading adblock rules."
+        case .unexpectedStatus(let statusCode):
+            return "Unexpected HTTP status \(statusCode) while downloading adblock rules."
+        case .missingCachedRules:
+            return "No cached adblock rules are available."
+        case .invalidRulesData:
+            return "Downloaded adblock rules were invalid."
+        }
+    }
+}
+
+public struct AdblockRulesRefreshError: Sendable, Equatable {
+    public let message: String
+    public let recordedAt: Date
+    public let isConnectivityIssue: Bool
+
+    public init(message: String, recordedAt: Date, isConnectivityIssue: Bool) {
+        self.message = message
+        self.recordedAt = recordedAt
+        self.isConnectivityIssue = isConnectivityIssue
+    }
+}
+
 public actor AdblockRulesStore {
     private struct CacheMetadata: Codable {
         var etag: String?
         var lastModified: String?
         var rulesHash: String?
         var lastFetchedAt: Date?
+        var lastErrorMessage: String?
+        var lastErrorAt: Date?
+        var lastErrorIsConnectivity: Bool?
     }
 
     private struct CachedContentRules: Codable {
@@ -94,6 +124,40 @@ public actor AdblockRulesStore {
         loadRulesFile()
     }
 
+    public func loadLastFetchedAt() -> Date? {
+        loadMetadata()?.lastFetchedAt
+    }
+
+    public func loadLastRefreshError() -> AdblockRulesRefreshError? {
+        guard
+            let metadata = loadMetadata(),
+            let message = metadata.lastErrorMessage
+        else {
+            return nil
+        }
+        let recordedAt = metadata.lastErrorAt ?? Date.distantPast
+        let isConnectivityIssue = metadata.lastErrorIsConnectivity ?? false
+        return AdblockRulesRefreshError(
+            message: message,
+            recordedAt: recordedAt,
+            isConnectivityIssue: isConnectivityIssue
+        )
+    }
+
+    public func recordRefreshError(_ error: AdblockRulesRefreshError) {
+        var metadata = loadMetadata() ?? CacheMetadata()
+        metadata.lastErrorMessage = error.message
+        metadata.lastErrorAt = error.recordedAt
+        metadata.lastErrorIsConnectivity = error.isConnectivityIssue
+        saveMetadata(metadata)
+    }
+
+    private func clearRefreshError(in metadata: inout CacheMetadata) {
+        metadata.lastErrorMessage = nil
+        metadata.lastErrorAt = nil
+        metadata.lastErrorIsConnectivity = nil
+    }
+
     public func refreshContentRules() async throws -> AdblockContentRulesResult {
         try ensureCacheDirectory()
 
@@ -101,6 +165,11 @@ public actor AdblockRulesStore {
         let rulesHash = sha256Hex(rules)
 
         if let cached = loadCachedContentRulesFile(), cached.sourceHash == rulesHash {
+            var updatedMetadata = metadata ?? CacheMetadata()
+            updatedMetadata.rulesHash = rulesHash
+            updatedMetadata.lastFetchedAt = Date()
+            clearRefreshError(in: &updatedMetadata)
+            saveMetadata(updatedMetadata)
             let contentRules = AdblockContentRules(rulesJSON: cached.rulesJSON, truncated: cached.truncated)
             return AdblockContentRulesResult(contentRules: contentRules, rulesSourceHash: rulesHash)
         }
@@ -117,6 +186,7 @@ public actor AdblockRulesStore {
         var updatedMetadata = metadata ?? CacheMetadata()
         updatedMetadata.rulesHash = rulesHash
         updatedMetadata.lastFetchedAt = Date()
+        clearRefreshError(in: &updatedMetadata)
         saveMetadata(updatedMetadata)
 
         return AdblockContentRulesResult(contentRules: converted, rulesSourceHash: rulesHash)

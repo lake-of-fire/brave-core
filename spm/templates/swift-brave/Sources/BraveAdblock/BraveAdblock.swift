@@ -1,5 +1,7 @@
 import Foundation
+#if canImport(BraveAdblockCore) && os(iOS) && !targetEnvironment(macCatalyst)
 import BraveAdblockCore
+#endif
 
 public struct AdblockContentRules: Sendable, Equatable {
     public let rulesJSON: String
