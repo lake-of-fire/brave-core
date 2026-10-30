@@ -1,0 +1,33 @@
+{
+  "originHash" : "7c0900fcea3af60918e8a7f14b48391933e6dc7f645889175b3e9fc9f94e9e31",
+  "pins" : [
+    {
+      "identity" : "lrucache",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/nicklockwood/LRUCache.git",
+      "state" : {
+        "revision" : "cb5b2bd0da83ad29c0bec762d39f41c8ad0eaf3e",
+        "version" : "1.2.1"
+      }
+    },
+    {
+      "identity" : "swift-collections",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/apple/swift-collections.git",
+      "state" : {
+        "branch" : "main",
+        "revision" : "63bfbed01a39126550b0f1ac87ac48027697831a"
+      }
+    },
+    {
+      "identity" : "swiftui-webview",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/lake-of-fire/swiftui-webview.git",
+      "state" : {
+        "branch" : "main",
+        "revision" : "71cfcd9646384324accbbe1e3f302d62a240b3ad"
+      }
+    }
+  ],
+  "version" : 3
+}

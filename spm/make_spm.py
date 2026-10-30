@@ -1,12 +1,11 @@
 import argparse
-import errno
 import json
 import os
 import re
 import shutil
 import subprocess
 import sys
-import time
+import tempfile
 from pathlib import Path
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -27,7 +26,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("swift_brave_path", help="Path to the swift-brave directory")
     parser.add_argument("--skip-build", action="store_true", help="Skip building the XCFramework")
     parser.add_argument("--skip-tests", action="store_true", help="Skip running swift test")
-    return parser.parse_args()
+    parser.add_argument(
+        "--build-only", action="store_true",
+        help="Build an already generated package without changing source inputs",
+    )
+    args = parser.parse_args()
+    if args.build_only and args.skip_build:
+        parser.error("--build-only cannot be combined with --skip-build")
+    return args
 
 
 def run(cmd, cwd=None, env=None):
@@ -63,36 +69,41 @@ def is_within(root: Path, child: Path) -> bool:
         return False
 
 
+def move_to_trash(path: Path, destination=None):
+    # Resolve before touching output. Refuse to follow a generated link to an
+    # unrelated tree; the generator only replaces its own ordinary paths.
+    if path.is_symlink():
+        raise SystemExit(f"Refusing to replace a symlink: {path}")
+    resolved = path.resolve(strict=True)
+    if resolved != path.absolute():
+        raise SystemExit(f"Refusing an aliased generated path: {path}")
+    trash = Path.home() / ".Trash"
+    if trash.resolve() != trash.absolute():
+        raise SystemExit(f"Refusing an aliased Trash directory: {trash}")
+    trash.mkdir(exist_ok=True)
+    if destination is None:
+        destination = Path(tempfile.mkdtemp(prefix="swift-brave-generated-", dir=trash))
+    shutil.move(str(resolved), str(destination / path.name))
+
+
 def clean_destination(dest: Path):
-    for entry in dest.iterdir():
-        if entry.name in ALLOWED_ROOT_ENTRIES:
-            continue
-        if not is_within(dest, entry):
-            raise SystemExit(f"Refusing to remove outside of destination: {entry}")
-        if entry.is_symlink() or entry.is_file():
-            entry.unlink()
-        else:
-            remove_tree(entry)
+    entries = [entry for entry in dest.iterdir() if entry.name not in ALLOWED_ROOT_ENTRIES]
+    for entry in entries:
+        if entry.is_symlink() or not is_within(dest, entry):
+            raise SystemExit(f"Refusing to replace outside of destination: {entry}")
+    if entries:
+        trash = Path.home() / ".Trash"
+        if trash.resolve() != trash.absolute():
+            raise SystemExit(f"Refusing an aliased Trash directory: {trash}")
+        trash.mkdir(exist_ok=True)
+        destination = Path(tempfile.mkdtemp(prefix="swift-brave-generated-", dir=trash))
+        for entry in entries:
+            move_to_trash(entry, destination)
+        print(f"# previous generated output retained at {destination}")
 
 
 def remove_tree(path: Path):
-    last_exc = None
-    for _ in range(3):
-        try:
-            shutil.rmtree(path)
-            return
-        except OSError as exc:
-            if exc.errno != errno.ENOTEMPTY:
-                raise
-            last_exc = exc
-            time.sleep(0.05)
-    if last_exc is not None:
-        for root, dirs, files in os.walk(path, topdown=False):
-            for name in files:
-                Path(root, name).unlink()
-            for name in dirs:
-                Path(root, name).rmdir()
-        path.rmdir()
+    move_to_trash(path)
 
 
 def copy_templates(dest: Path):
@@ -100,6 +111,8 @@ def copy_templates(dest: Path):
         raise SystemExit(f"Missing templates at {TEMPLATES_DIR}")
     for item in TEMPLATES_DIR.rglob("*"):
         relative = item.relative_to(TEMPLATES_DIR)
+        if "__pycache__" in relative.parts or item.suffix in {".pyc", ".pyo"}:
+            continue
         target = dest / relative
         if target.name == ".gitignore" and target.exists():
             continue
@@ -129,7 +142,7 @@ def copy_sources(dest: Path):
 
     rust_src = ROOT_DIR / "components" / "brave_shields" / "core" / "browser" / "adblock" / "rs"
     if rust_dst.exists():
-        shutil.rmtree(rust_dst)
+        remove_tree(rust_dst)
     shutil.copytree(rust_src, rust_dst)
 
 
@@ -177,7 +190,7 @@ def configure_rust_release_profile(dest: Path):
         suffix = "\n"
 
     def ensure_setting(block_text: str, key: str, value: str) -> str:
-        pattern = re.compile(rf"^{re.escape(key)}\\s*=.*$", re.MULTILINE)
+        pattern = re.compile(rf"^{re.escape(key)}\s*=.*$", re.MULTILINE)
         if pattern.search(block_text):
             return pattern.sub(f"{key} = {value}", block_text, count=1)
         return block_text.rstrip() + f"\n{key} = {value}\n"
@@ -194,6 +207,7 @@ def configure_rust_release_profile(dest: Path):
     else:
         updated = prefix + updated_content + suffix
 
+    updated = updated.rstrip() + "\n"
     if updated != text:
         cargo_toml.write_text(updated)
 
@@ -309,7 +323,7 @@ def build_xcframework(dest: Path):
 
     build_dir = dest / "Build"
     if build_dir.exists():
-        shutil.rmtree(build_dir)
+        remove_tree(build_dir)
     build_dir.mkdir()
 
     run(["cargo", "generate-lockfile"], cwd=rust_dir)
@@ -399,7 +413,7 @@ def build_xcframework(dest: Path):
 
     xcframework_path = dest / "Binary" / "BraveAdblockCore.xcframework"
     if xcframework_path.exists():
-        shutil.rmtree(xcframework_path)
+        remove_tree(xcframework_path)
     xcframework_path.parent.mkdir(parents=True, exist_ok=True)
 
     run([
@@ -421,7 +435,7 @@ def build_xcframework(dest: Path):
         str(xcframework_path),
     ])
 
-    shutil.rmtree(build_dir)
+    remove_tree(build_dir)
 
 
 def generate_cxx_headers(dest: Path, include_dir: Path, adblock_include_dir: Path):
@@ -503,12 +517,16 @@ def main() -> int:
     args = parse_args()
     dest = ensure_swift_brave_dir(Path(args.swift_brave_path))
 
-    clean_destination(dest)
-    copy_templates(dest)
-    copy_sources(dest)
-    apply_patches(dest)
-    normalize_rust_features(dest)
-    configure_rust_release_profile(dest)
+    if args.build_only:
+        if not (dest / "Package.swift").is_file() or not (dest / "Sources" / "BraveAdblockRust" / "Cargo.toml").is_file():
+            raise SystemExit("--build-only requires an already generated SwiftBrave package")
+    else:
+        clean_destination(dest)
+        copy_templates(dest)
+        copy_sources(dest)
+        apply_patches(dest)
+        normalize_rust_features(dest)
+        configure_rust_release_profile(dest)
 
     if not args.skip_build:
         build_xcframework(dest)
