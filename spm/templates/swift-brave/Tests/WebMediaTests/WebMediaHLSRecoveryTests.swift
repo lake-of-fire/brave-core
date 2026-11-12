@@ -191,6 +191,148 @@ final class WebMediaHLSRecoveryTests: XCTestCase {
         XCTAssertTrue(receipt.requiresDownloaderValidation)
     }
 
+    func testTasklessCompletedNativeRecoveryPrecedesUnsupportedRemoteHeaders() throws {
+        let item = WebMediaInfo(name: "Interrupted", src: "https://example.test/audio.m3u8",
+            pageSrc: "https://example.test/watch", pageTitle: "Interrupted", mimeType: "application/vnd.apple.mpegurl",
+            duration: 10, detected: true, tagId: "interrupted", isInvisible: false)
+        let directory = URL(fileURLWithPath: "/private/owned-native-completion")
+        let artifact = DownloadedWebMediaArtifact(relativeMediaPath: "media-completed.hlsref",
+            mimeType: item.mimeType, byteCount: 10)
+        // The OS cache/registry proof is injected; this test does not fabricate
+        // a playable package. It exercises the actual coordinator admission.
+        for headers in [["Referer": "https://example.test/watch"], ["Cookie": "legacy=private"]] {
+            let media = ResolvedWebMedia(mediaInfo: item, url: URL(string: item.src)!, mimeType: item.mimeType,
+                requestHeaders: headers, resolutionMethod: .direct)
+            let key = try WebMediaDownloadedArtifactReceipt.requestKey(for: media)
+            XCTAssertThrowsError(try WebMediaNativeAssetOptions.options(for: media))
+            for phase in [WebMediaHLSDownloadCoordinator.Phase.prepared, .running, .received] {
+                let record = WebMediaHLSDownloadCoordinator.Record(key: "destination", sessionIdentifier: "owned",
+                    identifier: "resource", destination: .init(directory), requestKey: key,
+                    token: UUID().uuidString, taskIdentifier: nil, phase: phase,
+                    location: .init(directory.appendingPathComponent("native.movpkg")))
+                var publications = 0
+                let admission = try WebMediaHLSDownloadCoordinator.admitNativeRequest(media: media,
+                    cookieContext: nil, record: record, requestKey: key, hasLiveTask: false,
+                    publishedPayloadIsPlayable: { _, _ in XCTFail("Not a published record"); return false },
+                    nativeLocationIsPlayable: { $0.phase == phase }, publishCompleted: { completed in
+                        XCTAssertEqual(completed.token, record.token)
+                        publications += 1
+                        return artifact
+                    })
+                guard case .completed(let reused) = admission else { return XCTFail("Expected local publication") }
+                XCTAssertEqual(reused, artifact)
+                XCTAssertEqual(publications, 1)
+                for liveTask in [false, true] {
+                    XCTAssertThrowsError(try WebMediaHLSDownloadCoordinator.admitNativeRequest(media: media,
+                        cookieContext: nil, record: record, requestKey: key, hasLiveTask: liveTask,
+                        publishedPayloadIsPlayable: { _, _ in false }, nativeLocationIsPlayable: { _ in false },
+                        publishCompleted: { _ in XCTFail("Unproven output cannot publish"); return artifact }))
+                }
+                XCTAssertThrowsError(try WebMediaHLSDownloadCoordinator.admitNativeRequest(media: media,
+                    cookieContext: nil, record: record, requestKey: "changed-contract", hasLiveTask: false,
+                    publishedPayloadIsPlayable: { _, _ in XCTFail("Different identity"); return true },
+                    nativeLocationIsPlayable: { _ in XCTFail("Different identity"); return true },
+                    publishCompleted: { _ in XCTFail("Different identity cannot publish"); return artifact }))
+            }
+        }
+    }
+
+    func testChangedNativeOptionalityCannotReusePreparedCredentialArtifact() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let configuration = WebMediaOfflineStore.Configuration(persistentRootURL: root.appendingPathComponent("persistent"),
+            transientRootURL: root.appendingPathComponent("transient"), excludeFromBackup: false)
+        let hints = ["Referer": "https://example.test/watch"]
+        let item = WebMediaInfo(name: "Optionality", src: "https://example.test/audio.m3u8",
+            pageSrc: "https://example.test/watch", pageTitle: "Optionality", mimeType: "application/vnd.apple.mpegurl",
+            duration: 10, detected: true, tagId: "optionality", isInvisible: false)
+        let original = ResolvedWebMedia(mediaInfo: item, url: URL(string: item.src)!, mimeType: item.mimeType,
+            requestHeaders: hints, nativeOptionalRequestHeaders: hints, resolutionMethod: .direct)
+        let context = WebMediaHLSCookieContext([try cookie("same-account")])
+        let initial = ReceiptValidatingHLSDownloader(context: context)
+        let first = WebMediaOfflineStore(configuration: configuration,
+            downloader: WebMediaAssetDownloader(hlsDownloaderFactory: { initial }))
+        try await WebMediaOfflineStoreTesting.$afterDownloadedArtifact.withValue({ throw RecoveryFailure.postDownload }) {
+            do {
+                _ = try await first.download(original, storageScope: .transient, thumbnail: .none)
+                XCTFail("Expected interrupted Store publication")
+            } catch RecoveryFailure.postDownload {}
+        }
+        let records = try await first.allDownloadRecords()
+        let record = try XCTUnwrap(records.first)
+        _ = try await first.cancelDownload(id: record.id)
+        let initialDestination = await initial.destination
+        let directory = try XCTUnwrap(initialDestination)
+        let payloadURL = directory.appendingPathComponent("prepared.bin")
+        let payload = try Data(contentsOf: payloadURL)
+        let current = ReceiptValidatingHLSDownloader(context: context)
+        let reopened = WebMediaOfflineStore(configuration: configuration,
+            downloader: WebMediaAssetDownloader(hlsDownloaderFactory: { current }))
+        let required = ResolvedWebMedia(mediaInfo: item, url: original.url, mimeType: item.mimeType,
+            requestHeaders: hints, resolutionMethod: .direct)
+        do {
+            _ = try await reopened.download(required, storageScope: .transient, thumbnail: .none)
+            XCTFail("Changed header contract must reach the context owner")
+        } catch RecoveryFailure.changedCredentials {}
+        XCTAssertEqual(try Data(contentsOf: payloadURL), payload)
+        let reused = await current.reused
+        let transfers = await current.transfers
+        XCTAssertEqual(reused, 0)
+        XCTAssertEqual(transfers, 0)
+        _ = try await reopened.cancelDownload(id: record.id)
+    }
+
+    func testActiveDownloadCannotCoalesceDifferentNativeHeaderContract() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let downloader = HeaderContractHoldingDownloader()
+        let store = WebMediaOfflineStore(configuration: .init(
+            persistentRootURL: root.appendingPathComponent("persistent"),
+            transientRootURL: root.appendingPathComponent("transient"), excludeFromBackup: false), downloader: downloader)
+        let item = WebMediaInfo(name: "Coalescing", src: "https://example.test/audio.m3u8",
+            pageSrc: "https://example.test/watch", pageTitle: "Coalescing", mimeType: "application/vnd.apple.mpegurl",
+            duration: 10, detected: true, tagId: "coalescing", isInvisible: false)
+        let hints = ["Referer": "https://example.test/watch"]
+        let optional = ResolvedWebMedia(mediaInfo: item, url: URL(string: item.src)!, mimeType: item.mimeType,
+            requestHeaders: hints, nativeOptionalRequestHeaders: hints, resolutionMethod: .direct)
+        let admitted = try await store.enqueueDownload(optional, storageScope: .transient, thumbnail: .none)
+        await downloader.waitForEntry()
+        let same = try await store.enqueueDownload(optional, storageScope: .transient, thumbnail: .none)
+        XCTAssertEqual(same.id, admitted.id)
+        let required = ResolvedWebMedia(mediaInfo: item, url: optional.url, mimeType: item.mimeType,
+            requestHeaders: hints, resolutionMethod: .direct)
+        do {
+            _ = try await store.enqueueDownload(required, storageScope: .transient, thumbnail: .none)
+            XCTFail("A different contract cannot attach to the active transfer")
+        } catch WebMediaOfflineStoreError.downloadInProgress {}
+        _ = try await store.cancelDownload(id: admitted.id)
+        let entries = await downloader.entries
+        XCTAssertEqual(entries, 1)
+    }
+
+    func testCommittedLocalArtifactReusesWithoutRemoteHeaderValidation() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let configuration = WebMediaOfflineStore.Configuration(persistentRootURL: root.appendingPathComponent("persistent"),
+            transientRootURL: root.appendingPathComponent("transient"), excludeFromBackup: false)
+        let item = WebMediaInfo(name: "Local", src: "https://example.test/audio.mp3",
+            pageSrc: "https://example.test/watch", pageTitle: "Local", mimeType: "audio/mpeg",
+            duration: 10, detected: true, tagId: "local", isInvisible: false)
+        let source = ResolvedWebMedia(mediaInfo: item, url: URL(string: item.src)!, mimeType: item.mimeType,
+            requestHeaders: ["Authorization": "Bearer private"], resolutionMethod: .direct)
+        let first = WebMediaOfflineStore(configuration: configuration, downloader: PreparedFileDownloader())
+        let saved = try await first.download(source, storageScope: .transient, thumbnail: .none)
+        let current = PreparedFileDownloader()
+        let reopened = WebMediaOfflineStore(configuration: configuration, downloader: current)
+        XCTAssertThrowsError(try WebMediaNativeAssetOptions.options(for: source))
+        let reused = try await reopened.download(source, storageScope: .transient, thumbnail: .none)
+        XCTAssertEqual(reused.id, saved.id)
+        XCTAssertEqual(try Data(contentsOf: reused.localMediaURL), Data("generic payload".utf8))
+        XCTAssertNil(try WebMediaNativeAssetOptions.options(for: reused.makeResolvedMedia()))
+        let calls = await current.calls
+        XCTAssertEqual(calls, 0)
+    }
+
     private func cookie(_ value: String) throws -> HTTPCookie {
         try XCTUnwrap(HTTPCookie(properties: [
             .name: "session", .value: value, .domain: "example.test", .path: "/"
@@ -283,5 +425,22 @@ private actor PreparedFileDownloader: WebMediaArtifactDownloading {
         let bytes = Data("generic payload".utf8)
         try bytes.write(to: directory.appendingPathComponent("prepared.mp3"))
         return .init(relativeMediaPath: "prepared.mp3", mimeType: "audio/mpeg", byteCount: Int64(bytes.count))
+    }
+}
+
+private actor HeaderContractHoldingDownloader: WebMediaArtifactDownloading {
+    private(set) var entries = 0
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+    func waitForEntry() async {
+        if entries > 0 { return }
+        await withCheckedContinuation { waiters.append($0) }
+    }
+    func download(media: ResolvedWebMedia, into directory: URL, identifier: String,
+                  onProgress: @escaping @Sendable (WebMediaDownloadProgress) -> Void) async throws -> DownloadedWebMediaArtifact {
+        entries += 1
+        waiters.forEach { $0.resume() }
+        waiters.removeAll()
+        try await Task.sleep(nanoseconds: 60_000_000_000)
+        throw CancellationError()
     }
 }

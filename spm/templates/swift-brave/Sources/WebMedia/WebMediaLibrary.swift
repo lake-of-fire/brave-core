@@ -71,7 +71,8 @@ public actor WebMediaLibrary {
                 .first { ["http", "https"].contains($0.scheme?.lowercased() ?? "") }
             let fallback = remoteURL.map {
                 ResolvedWebMedia(mediaInfo: item, url: $0, mimeType: stored.mimeType,
-                                 requestHeaders: requestContext.headers, resolutionMethod: .fallback)
+                                 requestHeaders: requestContext.headers,
+                                     nativeOptionalRequestHeaders: requestContext.nativeOptionalRequestHeaders, resolutionMethod: .fallback)
             }
             return WebMediaPlaybackResolution(
                 media: stored.makeResolvedMedia(for: item), offlineMediaID: stored.id, fallback: fallback
@@ -96,11 +97,13 @@ public actor WebMediaLibrary {
                 return nil
             }
             return ResolvedWebMedia(mediaInfo: item, url: url, mimeType: item.normalizedMimeType,
-                                    requestHeaders: requestContext.headers, resolutionMethod: .fallback)
+                                    requestHeaders: requestContext.headers,
+                                     nativeOptionalRequestHeaders: requestContext.nativeOptionalRequestHeaders, resolutionMethod: .fallback)
         }
         return WebMediaPlaybackResolution(
             media: ResolvedWebMedia(mediaInfo: item, url: resolved.url, mimeType: resolved.mimeType,
                                     requestHeaders: resolved.requestHeaders,
+                                     nativeOptionalRequestHeaders: resolved.nativeOptionalRequestHeaders,
                                     resolutionMethod: resolved.resolutionMethod),
             offlineMediaID: nil, fallback: fallback
         )

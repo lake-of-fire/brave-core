@@ -252,6 +252,7 @@ public struct ResolvedWebMediaSnapshot: Codable, Hashable, Sendable {
     public let resolvedMediaURL: URL
     public let mimeType: String?
     public let requestHeaders: [String: String]
+    public let nativeOptionalRequestHeaders: [String: String]
     public let resolutionMethod: WebMediaResolutionMethod
 
     public init(media: ResolvedWebMedia) {
@@ -259,6 +260,7 @@ public struct ResolvedWebMediaSnapshot: Codable, Hashable, Sendable {
         self.resolvedMediaURL = media.url
         self.mimeType = media.mimeType
         self.requestHeaders = media.requestHeaders
+        self.nativeOptionalRequestHeaders = media.nativeOptionalRequestHeaders
         self.resolutionMethod = media.resolutionMethod
     }
 
@@ -267,12 +269,15 @@ public struct ResolvedWebMediaSnapshot: Codable, Hashable, Sendable {
         resolvedMediaURL: URL,
         mimeType: String?,
         requestHeaders: [String: String],
+        nativeOptionalRequestHeaders: [String: String] = [:],
         resolutionMethod: WebMediaResolutionMethod
     ) {
         self.mediaInfo = mediaInfo
         self.resolvedMediaURL = resolvedMediaURL
         self.mimeType = mimeType
         self.requestHeaders = requestHeaders
+        self.nativeOptionalRequestHeaders = WebMediaRequestContext.matchingNativeOptionalHeaders(
+            nativeOptionalRequestHeaders, in: requestHeaders)
         self.resolutionMethod = resolutionMethod
     }
 
@@ -282,6 +287,7 @@ public struct ResolvedWebMediaSnapshot: Codable, Hashable, Sendable {
             url: resolvedMediaURL,
             mimeType: mimeType,
             requestHeaders: requestHeaders,
+            nativeOptionalRequestHeaders: nativeOptionalRequestHeaders,
             resolutionMethod: resolutionMethod
         )
     }
@@ -292,6 +298,7 @@ public struct ResolvedWebMediaSnapshot: Codable, Hashable, Sendable {
         case resolvedMediaURL
         case mimeType
         case requestHeaders
+        case nativeOptionalRequestHeaders
         case resolutionMethod
     }
 
@@ -301,7 +308,11 @@ public struct ResolvedWebMediaSnapshot: Codable, Hashable, Sendable {
             ?? container.decode(WebMediaInfo.self, forKey: .legacyPlaylistInfo)
         self.resolvedMediaURL = try container.decode(URL.self, forKey: .resolvedMediaURL)
         self.mimeType = try container.decodeIfPresent(String.self, forKey: .mimeType)
-        self.requestHeaders = try container.decodeIfPresent([String: String].self, forKey: .requestHeaders) ?? [:]
+        let headers = try container.decodeIfPresent([String: String].self, forKey: .requestHeaders) ?? [:]
+        self.requestHeaders = headers
+        self.nativeOptionalRequestHeaders = WebMediaRequestContext.matchingNativeOptionalHeaders(
+            try container.decodeIfPresent([String: String].self, forKey: .nativeOptionalRequestHeaders) ?? [:],
+            in: headers)
         self.resolutionMethod = try container.decode(WebMediaResolutionMethod.self, forKey: .resolutionMethod)
     }
 
@@ -311,6 +322,9 @@ public struct ResolvedWebMediaSnapshot: Codable, Hashable, Sendable {
         try container.encode(resolvedMediaURL, forKey: .resolvedMediaURL)
         try container.encodeIfPresent(mimeType, forKey: .mimeType)
         try container.encode(requestHeaders, forKey: .requestHeaders)
+        if !nativeOptionalRequestHeaders.isEmpty {
+            try container.encode(nativeOptionalRequestHeaders, forKey: .nativeOptionalRequestHeaders)
+        }
         try container.encode(resolutionMethod, forKey: .resolutionMethod)
     }
 }
@@ -444,8 +458,11 @@ struct WebMediaDownloadedArtifactReceipt: Codable {
     static func requestKey(for media: ResolvedWebMedia) throws -> String {
         let encoder = JSONEncoder()
         encoder.outputFormatting = .sortedKeys
-        let value = media.mediaInfo.resourceLookupKey + "\u{1F}" + media.url.absoluteString
+        var value = media.mediaInfo.resourceLookupKey + "\u{1F}" + media.url.absoluteString
             + "\u{1F}" + String(decoding: try encoder.encode(media.requestHeaders), as: UTF8.self)
+        if !media.nativeOptionalRequestHeaders.isEmpty {
+            value += "\u{1F}native-optional:" + String(decoding: try encoder.encode(media.nativeOptionalRequestHeaders), as: UTF8.self)
+        }
         return SHA256.hash(data: Data(value.utf8)).map { String(format: "%02x", $0) }.joined()
     }
 }
@@ -536,6 +553,7 @@ public final class WebMediaAssetDownloader: WebMediaArtifactDownloading, @unchec
             // journal/context, without requiring another HTTP probe first.
             let hlsMedia = ResolvedWebMedia(mediaInfo: media.mediaInfo, url: media.url,
                 mimeType: "application/vnd.apple.mpegurl", requestHeaders: media.requestHeaders,
+                                             nativeOptionalRequestHeaders: media.nativeOptionalRequestHeaders,
                 resolutionMethod: media.resolutionMethod)
             return try await hlsDownloaderFactory().download(
                 media: hlsMedia,
@@ -580,7 +598,10 @@ public final class WebMediaAssetDownloader: WebMediaArtifactDownloading, @unchec
         let identityURL = directory.appendingPathComponent(Self.partialIdentityFilename)
         let headerEncoder = JSONEncoder()
         headerEncoder.outputFormatting = .sortedKeys
-        let headerData = try headerEncoder.encode(media.requestHeaders)
+        var headerData = try headerEncoder.encode(media.requestHeaders)
+        if !media.nativeOptionalRequestHeaders.isEmpty {
+            headerData += Data("\u{1F}native-optional:".utf8) + (try headerEncoder.encode(media.nativeOptionalRequestHeaders))
+        }
         let requestKey = SHA256.hash(data: Data(media.url.absoluteString.utf8) + headerData)
             .map { String(format: "%02x", $0) }.joined()
         let savedIdentity = (try? Data(contentsOf: identityURL))
@@ -625,6 +646,7 @@ public final class WebMediaAssetDownloader: WebMediaArtifactDownloading, @unchec
         let responseMedia = ResolvedWebMedia(mediaInfo: media.mediaInfo, url: media.url,
                                             mimeType: responseMimeType ?? media.mimeType,
                                             requestHeaders: media.requestHeaders,
+                                             nativeOptionalRequestHeaders: media.nativeOptionalRequestHeaders,
                                             resolutionMethod: media.resolutionMethod)
         if responseMedia.containerKind == .hls {
             bytes.task.cancel()
@@ -737,6 +759,7 @@ public final class WebMediaAssetDownloader: WebMediaArtifactDownloading, @unchec
                 let hlsMedia = ResolvedWebMedia(mediaInfo: media.mediaInfo, url: media.url,
                                                mimeType: "application/vnd.apple.mpegurl",
                                                requestHeaders: media.requestHeaders,
+                                             nativeOptionalRequestHeaders: media.nativeOptionalRequestHeaders,
                                                resolutionMethod: media.resolutionMethod)
                 return try await hlsDownloaderFactory().download(
                     media: hlsMedia, into: directory, identifier: identifier, onProgress: onProgress
@@ -782,6 +805,7 @@ public final class WebMediaAssetDownloader: WebMediaArtifactDownloading, @unchec
             let hlsMedia = ResolvedWebMedia(mediaInfo: media.mediaInfo, url: media.url,
                                            mimeType: "application/vnd.apple.mpegurl",
                                            requestHeaders: media.requestHeaders,
+                                             nativeOptionalRequestHeaders: media.nativeOptionalRequestHeaders,
                                            resolutionMethod: media.resolutionMethod)
             return try await hlsDownloaderFactory().download(
                 media: hlsMedia, into: directory, identifier: identifier, onProgress: onProgress
@@ -1014,6 +1038,13 @@ public actor WebMediaOfflineStore {
             || (existingRecord?.state == .downloaded && existingRecord?.localMediaURL == nil)
 
         if let existingRecord, shouldRestart == false {
+            // A resource ID is not authority to coalesce different request
+            // credentials or native optionality into the old queued transfer.
+            guard let existing = try loadMetadata(id: identifier),
+                  try WebMediaDownloadedArtifactReceipt.requestKey(for: existing.resolvedMedia.makeResolvedMedia())
+                    == WebMediaDownloadedArtifactReceipt.requestKey(for: media) else {
+                throw WebMediaOfflineStoreError.downloadInProgress
+            }
             if activeDownloads[identifier] == nil,
                existingRecord.state == .queued || existingRecord.state == .downloading {
                 startDownload(identifier: identifier, onProgress: onProgress)
@@ -1824,6 +1855,7 @@ public actor WebMediaOfflineStore {
                 resolvedMediaURL: metadata.resolvedMedia.resolvedMediaURL,
                 mimeType: artifact.mimeType ?? metadata.resolvedMedia.mimeType,
                 requestHeaders: metadata.resolvedMedia.requestHeaders,
+                nativeOptionalRequestHeaders: metadata.resolvedMedia.nativeOptionalRequestHeaders,
                 resolutionMethod: metadata.resolvedMedia.resolutionMethod
             )
             guard isCurrentDownloadAttempt(identifier: identifier, attemptID: attemptID) else {

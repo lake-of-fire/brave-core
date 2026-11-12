@@ -11,24 +11,53 @@ public protocol WebMediaLoader: AnyObject {
 
 public struct WebMediaRequestContext: Hashable, Sendable {
     public let headers: [String: String]
+    /// Exact producer-declared hints native AVFoundation may omit. Arbitrary
+    /// caller headers remain required unless explicitly declared here.
+    public let nativeOptionalRequestHeaders: [String: String]
 
     public init(
         headers: [String: String] = [:],
         userAgent: String? = nil,
         referer: URL? = nil,
-        cookieHeader: String? = nil
+        cookieHeader: String? = nil,
+        nativeOptionalRequestHeaders: [String: String] = [:]
     ) {
         var headers = headers
-        if let userAgent {
-            headers["User-Agent"] = userAgent
+        var optional = Self.matchingNativeOptionalHeaders(nativeOptionalRequestHeaders, in: headers)
+        // Named parameters are required overrides, including same-value and
+        // differently cased overrides of a previously optional hint.
+        func require(_ name: String, _ value: String) {
+            headers = headers.filter { $0.key.caseInsensitiveCompare(name) != .orderedSame }
+            optional = optional.filter { $0.key.caseInsensitiveCompare(name) != .orderedSame }
+            headers[name] = value
         }
-        if let referer {
-            headers["Referer"] = referer.absoluteString
-        }
-        if let cookieHeader {
-            headers["Cookie"] = cookieHeader
-        }
+        if let userAgent { require("User-Agent", userAgent) }
+        if let referer { require("Referer", referer.absoluteString) }
+        if let cookieHeader { require("Cookie", cookieHeader) }
         self.headers = headers
+        self.nativeOptionalRequestHeaders = optional
+    }
+
+    /// Override atomically so an old optional declaration cannot survive a
+    /// required header replacement, even when the new value is identical.
+    public func addingRequiredHeaders(_ overrides: [String: String]) -> Self {
+        let names = Set(overrides.keys.map { $0.lowercased() })
+        var combined = headers.filter { !names.contains($0.key.lowercased()) }
+        combined.merge(overrides) { _, new in new }
+        return Self(headers: combined, nativeOptionalRequestHeaders:
+            nativeOptionalRequestHeaders.filter { !names.contains($0.key.lowercased()) })
+    }
+
+    static func matchingNativeOptionalHeaders(_ optional: [String: String], in headers: [String: String]) -> [String: String] {
+        // Credentials and UA are never downgraded to optional negotiation hints.
+        let required = Set(["authorization", "proxy-authorization", "cookie", "user-agent"])
+        return headers.filter { name, value in
+            guard !required.contains(name.lowercased()) else { return false }
+            let declarations = optional.filter { $0.key.caseInsensitiveCompare(name) == .orderedSame }
+            let actual = headers.filter { $0.key.caseInsensitiveCompare(name) == .orderedSame }
+            return !declarations.isEmpty && declarations.allSatisfy { $0.value == value }
+                && actual.allSatisfy { $0.value == value }
+        }
     }
 }
 
@@ -42,6 +71,7 @@ public struct ResolvedWebMedia: Hashable, Sendable {
     public let url: URL
     public let mimeType: String?
     public let requestHeaders: [String: String]
+    public let nativeOptionalRequestHeaders: [String: String]
     public let resolutionMethod: WebMediaResolutionMethod
 
     public var containerKind: WebMediaContainerKind {
@@ -65,12 +95,15 @@ public struct ResolvedWebMedia: Hashable, Sendable {
         url: URL,
         mimeType: String?,
         requestHeaders: [String: String] = [:],
+        nativeOptionalRequestHeaders: [String: String] = [:],
         resolutionMethod: WebMediaResolutionMethod
     ) {
         self.mediaInfo = mediaInfo
         self.url = url
         self.mimeType = mimeType
         self.requestHeaders = requestHeaders
+        self.nativeOptionalRequestHeaders = WebMediaRequestContext.matchingNativeOptionalHeaders(
+            nativeOptionalRequestHeaders, in: requestHeaders)
         self.resolutionMethod = resolutionMethod
     }
 }
@@ -191,7 +224,8 @@ public final class WebMediaStreamer: @unchecked Sendable {
         // A resolver may find a new transport URL; it does not own a new media
         // identity. Keep the requested resource as the presentation owner.
         return ResolvedWebMedia(mediaInfo: item, url: resolved.url, mimeType: resolved.mimeType,
-                                requestHeaders: resolved.requestHeaders, resolutionMethod: .fallback)
+                                requestHeaders: resolved.requestHeaders,
+                                nativeOptionalRequestHeaders: resolved.nativeOptionalRequestHeaders, resolutionMethod: .fallback)
     }
 
     private func resolveDirectMedia(
@@ -231,6 +265,7 @@ public final class WebMediaStreamer: @unchecked Sendable {
             url: url,
             mimeType: mimeType,
             requestHeaders: requestContext.headers,
+            nativeOptionalRequestHeaders: requestContext.nativeOptionalRequestHeaders,
             resolutionMethod: method
         )
     }

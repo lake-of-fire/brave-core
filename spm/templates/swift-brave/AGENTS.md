@@ -5,3 +5,5 @@
 - `Scripts/sync_web_media_sources.py` refreshes Brave JavaScript resources and normalizes existing Swift overlays. If used on generated output, carry the intended changes back into canonical templates; it does not generate the offline-store Swift implementation.
 - Link source-side and output-side PRs and record input revisions. Do not overwrite unrelated local work or assume a whole Brave update fixes the custom storage layer. Preserve upstream license/provenance notices.
 - Follow the current task's build/test limits. Report generation, compilation and runtime verification separately; never claim unrun checks passed.
+
+- Release tooling stages and compares generation against an exact selected commit before building. The generator's `--build-only` mode builds checked source without regeneration. The manual workflow emits immutable assets/provenance and a proposed manifest; the default branch is not rewritten. Existing binary identity changes require a separate release decision.

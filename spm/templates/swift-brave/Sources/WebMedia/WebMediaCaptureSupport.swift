@@ -318,6 +318,7 @@ public struct WebMediaCaptureResolvedMedia: Hashable, Sendable {
         url: URL,
         mimeType: String?,
         requestHeaders: [String: String],
+        nativeOptionalRequestHeaders: [String: String] = [:],
         resolutionMethod: WebMediaCaptureResolutionMethod
     ) {
         self.resolvedMedia = ResolvedWebMedia(
@@ -325,6 +326,7 @@ public struct WebMediaCaptureResolvedMedia: Hashable, Sendable {
             url: url,
             mimeType: mimeType,
             requestHeaders: requestHeaders,
+            nativeOptionalRequestHeaders: nativeOptionalRequestHeaders,
             resolutionMethod: resolutionMethod.rawValueCore
         )
     }
@@ -337,6 +339,7 @@ public struct WebMediaCaptureResolvedMedia: Hashable, Sendable {
     public var url: URL { resolvedMedia.url }
     public var mimeType: String? { resolvedMedia.mimeType }
     public var requestHeaders: [String: String] { resolvedMedia.requestHeaders }
+    public var nativeOptionalRequestHeaders: [String: String] { resolvedMedia.nativeOptionalRequestHeaders }
     public var resolutionMethod: WebMediaCaptureResolutionMethod { .init(resolvedMedia.resolutionMethod) }
 
     var rawValue: ResolvedWebMedia { resolvedMedia }
@@ -345,8 +348,8 @@ public struct WebMediaCaptureResolvedMedia: Hashable, Sendable {
 public struct WebMediaCaptureRequestContext: Hashable, Sendable {
     let requestContext: WebMediaRequestContext
 
-    public init(headers: [String: String] = [:]) {
-        self.requestContext = WebMediaRequestContext(headers: headers)
+    public init(headers: [String: String] = [:], nativeOptionalRequestHeaders: [String: String] = [:]) {
+        self.requestContext = WebMediaRequestContext(headers: headers, nativeOptionalRequestHeaders: nativeOptionalRequestHeaders)
     }
 
     init(_ requestContext: WebMediaRequestContext) {
@@ -354,6 +357,7 @@ public struct WebMediaCaptureRequestContext: Hashable, Sendable {
     }
 
     public var headers: [String: String] { requestContext.headers }
+    public var nativeOptionalRequestHeaders: [String: String] { requestContext.nativeOptionalRequestHeaders }
 
     var rawValue: WebMediaRequestContext { requestContext }
 }

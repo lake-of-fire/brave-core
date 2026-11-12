@@ -8,7 +8,7 @@ public final class WebMediaHLSAssetDownloader: NSObject, WebMediaHLSAssetDownloa
     private let cookieContext: WebMediaHLSCookieContext?
 
     /// Pass captured browser cookies as scoped cookie objects, never a combined
-    /// Cookie header. Nil preserves the existing caller's header behavior.
+    /// Cookie header. Nil requires every explicit header to be representable.
     public init(httpCookies: [HTTPCookie]? = nil) {
         cookieContext = httpCookies.map(WebMediaHLSCookieContext.init)
         super.init()
@@ -95,12 +95,12 @@ struct WebMediaHLSLocalReference: Codable, Hashable, Sendable {
     }
 }
 
-private final class WebMediaHLSDownloadCoordinator: NSObject, AVAssetDownloadDelegate, @unchecked Sendable {
+final class WebMediaHLSDownloadCoordinator: NSObject, AVAssetDownloadDelegate, @unchecked Sendable {
     static let shared = WebMediaHLSDownloadCoordinator()
 
-    private enum Phase: String, Codable, Sendable { case prepared, running, received, published, failed, cancelled }
+    enum Phase: String, Codable, Sendable { case prepared, running, received, published, failed, cancelled }
 
-    private struct Record: Codable, Sendable {
+    struct Record: Codable, Sendable {
         let key: String
         let sessionIdentifier: String
         let identifier: String
@@ -278,7 +278,8 @@ private final class WebMediaHLSDownloadCoordinator: NSObject, AVAssetDownloadDel
                         try? self.persist(abandoned)
                         task.cancel()
                     } else if entry.value.phase == .cancelled { task.cancel() }
-                    else if task.state == .suspended { task.resume() }
+                    // A suspended recovered task resumes only after a current
+                    // request validates its native header contract in startOrAttach.
                 }
                 for (key, record) in self.records
                     where !FileManager.default.fileExists(atPath: record.destination.url.path) && self.tasks[key] == nil {
@@ -295,6 +296,38 @@ private final class WebMediaHLSDownloadCoordinator: NSObject, AVAssetDownloadDel
         }
     }
 
+    enum NativeAdmission {
+        case completed(DownloadedWebMediaArtifact)
+        case remote([String: Any]?)
+    }
+
+    /// Local completion is independent of fresh remote header support. The
+    /// injected proofs are the real registry/cache checks in production; tests
+    /// isolate those OS boundaries while exercising this admission ordering.
+    static func admitNativeRequest(
+        media: ResolvedWebMedia, cookieContext: WebMediaHLSCookieContext?,
+        record: Record?, requestKey: String, hasLiveTask: Bool,
+        publishedPayloadIsPlayable: (Record, DownloadedWebMediaArtifact) -> Bool,
+        nativeLocationIsPlayable: (Record) -> Bool,
+        publishCompleted: (Record) throws -> DownloadedWebMediaArtifact
+    ) throws -> NativeAdmission {
+        if let record, record.requestKey == requestKey {
+            if record.phase == .published, let artifact = record.artifact,
+               publishedPayloadIsPlayable(record, artifact) {
+                return .completed(artifact)
+            }
+            if !hasLiveTask,
+               record.phase == .running || record.phase == .prepared || record.phase == .received,
+               nativeLocationIsPlayable(record) {
+                return .completed(try publishCompleted(record))
+            }
+        }
+        // No deletion, journal replacement, reattachment or resume occurs
+        // before this succeeds. A changed contract never inherits old output.
+        return .remote(try WebMediaHLSCookieContext.assetOptions(headers: media.requestHeaders,
+            cookieContext: cookieContext, nativeOptionalRequestHeaders: media.nativeOptionalRequestHeaders))
+    }
+
     private func startOrAttach(_ request: Request, media: ResolvedWebMedia, cookieContext: WebMediaHLSCookieContext?, directory: URL, identifier: String) {
         guard !request.finished else { return }
         guard !request.cancelled else { finish(request, with: .failure(CancellationError())); return }
@@ -304,6 +337,31 @@ private final class WebMediaHLSDownloadCoordinator: NSObject, AVAssetDownloadDel
             let key = Self.digest(identifier + "\u{1F}" + destination.path)
             let baseRequestKey = try WebMediaDownloadedArtifactReceipt.requestKey(for: media)
             let requestKey = try cookieContext?.requestKey(base: baseRequestKey) ?? baseRequestKey
+            let admission = try Self.admitNativeRequest(media: media, cookieContext: cookieContext,
+                record: records[key], requestKey: requestKey, hasLiveTask: tasks[key] != nil,
+                publishedPayloadIsPlayable: { record, artifact in
+                    Self.payloadExists(artifact, in: directory, identifier: record.identifier)
+                }, nativeLocationIsPlayable: { record in
+                    guard let location = record.location else { return false }
+                    return WebMediaNativeHLSAssets.resolve(.init(identifier: record.identifier,
+                        transferIdentifier: record.token, asset: location)) != nil
+                }, publishCompleted: { record in
+                    var received = record
+                    if received.phase != .received {
+                        received.phase = .received
+                        try self.persist(received)
+                    }
+                    return try self.publish(received)
+                })
+            let options: [String: Any]?
+            switch admission {
+            case .completed(let artifact):
+                self.finish(request, with: .success(artifact))
+                return
+            case .remote(let nativeOptions): options = nativeOptions
+            }
+            // Validate before registering this waiter, joining/resuming a native
+            // task, retiring a previous generation, or writing its replacement.
             request.key = key
             requests[key, default: [:]][request.id] = request
             if let record = records[key], record.phase == .cancelled {
@@ -316,31 +374,6 @@ private final class WebMediaHLSDownloadCoordinator: NSObject, AVAssetDownloadDel
                 try WebMediaNativeHLSAssets.remove(identifier: record.identifier, transferIdentifier: record.token)
             }
             if let record = records[key], record.requestKey == requestKey {
-                if record.phase == .published, let artifact = record.artifact,
-                   Self.payloadExists(artifact, in: directory, identifier: record.identifier) {
-                    finishRequests(key, with: .success(artifact))
-                    return
-                }
-                if tasks[key] == nil, record.phase == .running || record.phase == .prepared,
-                   let location = record.location,
-                   WebMediaNativeHLSAssets.resolve(.init(identifier: record.identifier,
-                       transferIdentifier: record.token, asset: location)) != nil {
-                    // The OS may finish while the process is absent, leaving
-                    // no live task to reattach. Its registered package and
-                    // offline cache prove that reference publication can resume.
-                    var received = record
-                    received.phase = .received
-                    try persist(received)
-                    try publish(received)
-                    return
-                }
-                if record.phase == .received,
-                   record.location.map({ FileManager.default.fileExists(atPath: $0.url.path) }) == true
-                    || (record.phase == .received && FileManager.default.fileExists(
-                        atPath: directory.appendingPathComponent("media-\(record.token).hlsref").path)) {
-                    try publish(record)
-                    return
-                }
                 if let task = tasks[key], record.phase == .running {
                     if task.state == .suspended { task.resume() }
                     return
@@ -362,9 +395,6 @@ private final class WebMediaHLSDownloadCoordinator: NSObject, AVAssetDownloadDel
                                 identifier: identifier, destination: destination, requestKey: requestKey,
                                 baseRequestKey: baseRequestKey, token: UUID().uuidString, taskIdentifier: nil, phase: .prepared)
             try persist(record)
-            let options = WebMediaHLSCookieContext.assetOptions(
-                headers: media.requestHeaders, cookieContext: cookieContext
-            )
             let asset = AVURLAsset(url: media.url, options: options)
             guard let task = session?.makeAssetDownloadTask(asset: asset,
                                                             assetTitle: media.mediaInfo.preferredDisplayName,
@@ -514,7 +544,8 @@ private final class WebMediaHLSDownloadCoordinator: NSObject, AVAssetDownloadDel
         }
     }
 
-    private func publish(_ record: Record) throws {
+    @discardableResult
+    private func publish(_ record: Record) throws -> DownloadedWebMediaArtifact {
         let directory = record.destination.url
         guard FileManager.default.fileExists(atPath: directory.path) else {
             throw WebMediaOfflineStoreError.mediaNotFound
@@ -549,6 +580,7 @@ private final class WebMediaHLSDownloadCoordinator: NSObject, AVAssetDownloadDel
             if !request.finished { request.onProgress(progress) }
         }
         finishRequests(record.key, with: .success(artifact))
+        return artifact
     }
 
     func urlSessionDidFinishEvents(forBackgroundURLSession session: URLSession) {

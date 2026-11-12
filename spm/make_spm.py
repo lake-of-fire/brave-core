@@ -25,7 +25,12 @@ MACOS_MIN_VERSION = "14.0"
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate the swift-brave SPM package.")
     parser.add_argument("swift_brave_path", help="Path to the swift-brave directory")
-    parser.add_argument("--skip-build", action="store_true", help="Skip building the XCFramework")
+    build_mode = parser.add_mutually_exclusive_group()
+    build_mode.add_argument("--skip-build", action="store_true", help="Skip building the XCFramework")
+    build_mode.add_argument(
+        "--build-only", action="store_true",
+        help="Build the existing package without regenerating or rewriting its sources",
+    )
     parser.add_argument("--skip-tests", action="store_true", help="Skip running swift test")
     return parser.parse_args()
 
@@ -177,7 +182,7 @@ def configure_rust_release_profile(dest: Path):
         suffix = "\n"
 
     def ensure_setting(block_text: str, key: str, value: str) -> str:
-        pattern = re.compile(rf"^{re.escape(key)}\\s*=.*$", re.MULTILINE)
+        pattern = re.compile(rf"^[ \t]*{re.escape(key)}[ \t]*=.*$", re.MULTILINE)
         if pattern.search(block_text):
             return pattern.sub(f"{key} = {value}", block_text, count=1)
         return block_text.rstrip() + f"\n{key} = {value}\n"
@@ -503,12 +508,13 @@ def main() -> int:
     args = parse_args()
     dest = ensure_swift_brave_dir(Path(args.swift_brave_path))
 
-    clean_destination(dest)
-    copy_templates(dest)
-    copy_sources(dest)
-    apply_patches(dest)
-    normalize_rust_features(dest)
-    configure_rust_release_profile(dest)
+    if not args.build_only:
+        clean_destination(dest)
+        copy_templates(dest)
+        copy_sources(dest)
+        apply_patches(dest)
+        normalize_rust_features(dest)
+        configure_rust_release_profile(dest)
 
     if not args.skip_build:
         build_xcframework(dest)
