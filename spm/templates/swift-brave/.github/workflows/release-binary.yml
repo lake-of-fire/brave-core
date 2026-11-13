@@ -1,0 +1,107 @@
+name: release-binary
+
+on:
+  workflow_dispatch:
+    inputs:
+      brave_core_commit:
+        description: "Reviewed immutable lake-of-fire/brave-core commit (40 hexadecimal characters)"
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    runs-on: macos-14
+    env:
+      SWIFT_COMMIT: ${{ github.sha }}
+      BRAVE_COMMIT: ${{ inputs.brave_core_commit }}
+      RELEASE_REPOSITORY: ${{ github.repository }}
+      RELEASE_ASSETS: ${{ runner.temp }}/release-assets-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - name: Checkout committed SwiftBrave
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          path: package
+          persist-credentials: false
+
+      - name: Validate immutable input and package checkout
+        working-directory: package
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          from Scripts.release_package import sha40, verify_checkout
+          sha40(os.environ["BRAVE_COMMIT"])
+          verify_checkout(os.getcwd(), os.environ["SWIFT_COMMIT"])
+          PY
+
+      - name: Checkout exact Brave input
+        uses: actions/checkout@v4
+        with:
+          repository: lake-of-fire/brave-core
+          ref: ${{ inputs.brave_core_commit }}
+          path: brave-core
+          persist-credentials: false
+          token: ${{ secrets.BRAVE_CORE_TOKEN || github.token }}
+
+      - name: Verify Brave readback
+        run: |
+          set -euo pipefail
+          python3 package/Scripts/release_package.py verify-checkout \
+            --repo "$GITHUB_WORKSPACE/brave-core" --commit "$BRAVE_COMMIT"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios,aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Generate, verify correspondence, build once, verify again and package
+        run: |
+          set -euo pipefail
+          python3 package/Scripts/release_package.py prepare \
+            --package "$GITHUB_WORKSPACE/package" --core "$GITHUB_WORKSPACE/brave-core" \
+            --swift-commit "$SWIFT_COMMIT" --brave-commit "$BRAVE_COMMIT" \
+            --repository "$RELEASE_REPOSITORY" --output "$RELEASE_ASSETS"
+
+      - name: Transfer verified release assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-assets
+          path: ${{ env.RELEASE_ASSETS }}/
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: prepare
+    runs-on: macos-14
+    permissions:
+      contents: write
+    env:
+      SWIFT_COMMIT: ${{ github.sha }}
+      RELEASE_REPOSITORY: ${{ github.repository }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Checkout fixed publication helper
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          path: package
+          persist-credentials: false
+
+      - name: Receive verified assets
+        uses: actions/download-artifact@v4
+        with:
+          name: release-assets
+          path: ${{ runner.temp }}/release-assets
+
+      - name: Publish new identity only (no branch writes or asset replacement)
+        run: |
+          set -euo pipefail
+          python3 package/Scripts/release_package.py verify-checkout \
+            --repo "$GITHUB_WORKSPACE/package" --commit "$SWIFT_COMMIT"
+          python3 package/Scripts/release_package.py publish \
+            --assets "$RUNNER_TEMP/release-assets" --repository "$RELEASE_REPOSITORY" \
+            --swift-commit "$SWIFT_COMMIT" --package "$GITHUB_WORKSPACE/package"
