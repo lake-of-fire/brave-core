@@ -1038,11 +1038,14 @@ public actor WebMediaOfflineStore {
             || (existingRecord?.state == .downloaded && existingRecord?.localMediaURL == nil)
 
         if let existingRecord, shouldRestart == false {
-            // A resource ID is not authority to coalesce different request
-            // credentials or native optionality into the old queued transfer.
+            // Fragments do not change the transferred resource. Keep exact
+            // credentials and native optionality when coalescing a queued transfer.
             guard let existing = try loadMetadata(id: identifier),
-                  try WebMediaDownloadedArtifactReceipt.requestKey(for: existing.resolvedMedia.makeResolvedMedia())
-                    == WebMediaDownloadedArtifactReceipt.requestKey(for: media) else {
+                  existing.resolvedMedia.mediaInfo.resourceLookupKey == media.mediaInfo.resourceLookupKey,
+                  WebMediaInfo.canonicalSourceLookupKey(for: existing.resolvedMedia.resolvedMediaURL.absoluteString)
+                    == WebMediaInfo.canonicalSourceLookupKey(for: media.url.absoluteString),
+                  existing.resolvedMedia.requestHeaders == media.requestHeaders,
+                  existing.resolvedMedia.nativeOptionalRequestHeaders == media.nativeOptionalRequestHeaders else {
                 throw WebMediaOfflineStoreError.downloadInProgress
             }
             if activeDownloads[identifier] == nil,

@@ -299,12 +299,25 @@ final class WebMediaHLSRecoveryTests: XCTestCase {
         await downloader.waitForEntry()
         let same = try await store.enqueueDownload(optional, storageScope: .transient, thumbnail: .none)
         XCTAssertEqual(same.id, admitted.id)
+        let fragment = ResolvedWebMedia(mediaInfo: item,
+            url: URL(string: "https://example.test/audio.m3u8#chapter")!, mimeType: item.mimeType,
+            requestHeaders: hints, nativeOptionalRequestHeaders: hints, resolutionMethod: .direct)
+        let sameResource = try await store.enqueueDownload(fragment, storageScope: .transient, thumbnail: .none)
+        XCTAssertEqual(sameResource.id, admitted.id)
         let required = ResolvedWebMedia(mediaInfo: item, url: optional.url, mimeType: item.mimeType,
             requestHeaders: hints, resolutionMethod: .direct)
-        do {
-            _ = try await store.enqueueDownload(required, storageScope: .transient, thumbnail: .none)
-            XCTFail("A different contract cannot attach to the active transfer")
-        } catch WebMediaOfflineStoreError.downloadInProgress {}
+        let changedCredentials = ResolvedWebMedia(mediaInfo: item, url: optional.url, mimeType: item.mimeType,
+            requestHeaders: hints.merging(["Cookie": "account=b"]) { _, new in new },
+            nativeOptionalRequestHeaders: hints, resolutionMethod: .direct)
+        let changedURL = ResolvedWebMedia(mediaInfo: item,
+            url: URL(string: "https://example.test/audio.m3u8?token=other")!, mimeType: item.mimeType,
+            requestHeaders: hints, nativeOptionalRequestHeaders: hints, resolutionMethod: .direct)
+        for conflicting in [required, changedCredentials, changedURL] {
+            do {
+                _ = try await store.enqueueDownload(conflicting, storageScope: .transient, thumbnail: .none)
+                XCTFail("A different request cannot attach to the active transfer")
+            } catch WebMediaOfflineStoreError.downloadInProgress {}
+        }
         _ = try await store.cancelDownload(id: admitted.id)
         let entries = await downloader.entries
         XCTAssertEqual(entries, 1)
