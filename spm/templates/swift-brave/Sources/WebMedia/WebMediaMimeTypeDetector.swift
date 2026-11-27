@@ -40,7 +40,10 @@ public struct WebMediaMimeTypeDetector {
     }
 
     public init(data: Data) {
-        if let prefix = Self.decodeBoundedUTF8Prefix(data.prefix(4096))?
+        if let prefix = Self.decodeBoundedUTF8Prefix(
+            data.prefix(4096),
+            reachedProbeLimit: data.count >= 4096
+        )?
             .trimmingCharacters(in: .whitespacesAndNewlines.union(CharacterSet(charactersIn: "\u{feff}"))),
            prefix.hasPrefix("#EXTM3U") {
             mimeType = "application/vnd.apple.mpegurl"
@@ -126,14 +129,18 @@ public struct WebMediaMimeTypeDetector {
         return [UInt8](data[offset..<(offset + header.count)]) == header
     }
 
-    private static func decodeBoundedUTF8Prefix(_ data: Data.SubSequence) -> String? {
+    private static func decodeBoundedUTF8Prefix(
+        _ data: Data.SubSequence,
+        reachedProbeLimit: Bool
+    ) -> String? {
         if let decoded = String(data: data, encoding: .utf8) {
             return decoded
         }
+        guard reachedProbeLimit else { return nil }
 
         // The probe is capped at 4 KB and may stop inside an otherwise valid
         // multibyte scalar. Ignore only a valid, incomplete scalar at that
-        // boundary; malformed UTF-8 elsewhere remains rejected.
+        // exact boundary. Malformed UTF-8 elsewhere and short payloads remain rejected.
         let bytes = [UInt8](data)
         let lowerBound = max(0, bytes.count - 4)
         for start in stride(from: bytes.count - 1, through: lowerBound, by: -1) {

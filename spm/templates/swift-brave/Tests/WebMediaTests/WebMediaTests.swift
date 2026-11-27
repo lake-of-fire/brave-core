@@ -607,6 +607,46 @@ final class WebMediaTests: XCTestCase {
         XCTAssertEqual(resolved.containerKind, .hls)
     }
 
+    func testMediaStreamerRejectsIncompleteUTF8InShortTextResponse() async {
+        var truncatedPlaylist = Data("#EXTM3U\n".utf8)
+        truncatedPlaylist.append(contentsOf: [0xE7])
+        XCTAssertLessThan(truncatedPlaylist.count, 4096)
+        XCTAssertNil(String(data: truncatedPlaylist, encoding: .utf8))
+
+        URLProtocolStub.handler = { request in
+            let response = HTTPURLResponse(
+                url: try XCTUnwrap(request.url),
+                statusCode: request.httpMethod == "HEAD" ? 405 : 206,
+                httpVersion: nil,
+                headerFields: request.httpMethod == "HEAD" ? nil : [
+                    "Content-Type": "text/plain",
+                    "Content-Range": "bytes 0-\(truncatedPlaylist.count - 1)/\(truncatedPlaylist.count)",
+                ]
+            )!
+            if request.httpMethod == "GET" {
+                XCTAssertEqual(request.value(forHTTPHeaderField: "Range"), "bytes=0-4095")
+            }
+            return (response, request.httpMethod == "HEAD" ? Data() : truncatedPlaylist)
+        }
+
+        let item = WebMediaInfo(
+            name: "Truncated extensionless response",
+            src: "https://cdn.example.com/live",
+            pageSrc: "https://example.com/watch/1",
+            pageTitle: "Live stream",
+            mimeType: "",
+            duration: 10,
+            detected: true,
+            tagId: "hls-short-truncated-utf8",
+            isInvisible: false
+        )
+        let streamer = WebMediaStreamer(urlSession: makeSession())
+
+        await XCTAssertThrowsErrorAsync(try await streamer.resolveMedia(item)) { error in
+            XCTAssertEqual(error as? WebMediaStreamer.PlaybackError, .couldNotDeterminePlayableMedia)
+        }
+    }
+
     func testMediaStreamerFallsBackWhenPrimaryURLIsBlob() async throws {
         var fallbackItem = WebMediaInfo(
             name: "Fallback",
