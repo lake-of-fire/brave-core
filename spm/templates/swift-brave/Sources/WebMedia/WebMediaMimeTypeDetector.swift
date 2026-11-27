@@ -40,7 +40,10 @@ public struct WebMediaMimeTypeDetector {
     }
 
     public init(data: Data) {
-        if let prefix = String(data: data.prefix(4096), encoding: .utf8)?
+        if let prefix = Self.decodeBoundedUTF8Prefix(
+            data.prefix(4096),
+            reachedProbeLimit: data.count >= 4096
+        )?
             .trimmingCharacters(in: .whitespacesAndNewlines.union(CharacterSet(charactersIn: "\u{feff}"))),
            prefix.hasPrefix("#EXTM3U") {
             mimeType = "application/vnd.apple.mpegurl"
@@ -124,5 +127,49 @@ public struct WebMediaMimeTypeDetector {
         }
 
         return [UInt8](data[offset..<(offset + header.count)]) == header
+    }
+
+    private static func decodeBoundedUTF8Prefix(
+        _ data: Data.SubSequence,
+        reachedProbeLimit: Bool
+    ) -> String? {
+        if let decoded = String(data: data, encoding: .utf8) {
+            return decoded
+        }
+        guard reachedProbeLimit else { return nil }
+
+        // The probe is capped at 4 KB and may stop inside an otherwise valid
+        // multibyte scalar. Ignore only a valid, incomplete scalar at that
+        // exact boundary. Malformed UTF-8 elsewhere and short payloads remain rejected.
+        let bytes = [UInt8](data)
+        let lowerBound = max(0, bytes.count - 4)
+        for start in stride(from: bytes.count - 1, through: lowerBound, by: -1) {
+            let lead = bytes[start]
+            let expectedLength: Int
+            switch lead {
+            case 0xC2...0xDF: expectedLength = 2
+            case 0xE0...0xEF: expectedLength = 3
+            case 0xF0...0xF4: expectedLength = 4
+            default: continue
+            }
+
+            let suffixLength = bytes.count - start
+            guard suffixLength < expectedLength,
+                  bytes[(start + 1)...].allSatisfy({ (0x80...0xBF).contains($0) })
+            else { continue }
+
+            if expectedLength >= 3, suffixLength >= 2 {
+                let continuation = bytes[start + 1]
+                if (lead == 0xE0 && continuation < 0xA0)
+                    || (lead == 0xED && continuation > 0x9F)
+                    || (lead == 0xF0 && continuation < 0x90)
+                    || (lead == 0xF4 && continuation > 0x8F) {
+                    continue
+                }
+            }
+
+            return String(data: Data(bytes[..<start]), encoding: .utf8)
+        }
+        return nil
     }
 }

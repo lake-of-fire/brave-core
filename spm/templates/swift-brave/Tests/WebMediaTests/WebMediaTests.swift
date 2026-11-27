@@ -563,6 +563,90 @@ final class WebMediaTests: XCTestCase {
         XCTAssertEqual(methods, ["HEAD", "GET"])
     }
 
+    func testMediaStreamerDetectsHLSWhenBoundedProbeEndsInsideUTF8Scalar() async throws {
+        var playlistPrefix = Data("#EXTM3U\n".utf8)
+        playlistPrefix.append(Data(repeating: 0x20, count: 4095 - playlistPrefix.count))
+        XCTAssertEqual(playlistPrefix.count, 4095)
+
+        var playlist = playlistPrefix
+        playlist.append(Data("猫".utf8))
+        playlist.append(Data("\n#EXTINF:10,\nsegment.ts\n".utf8))
+        XCTAssertEqual(String(data: playlist, encoding: .utf8), String(decoding: playlist, as: UTF8.self))
+        let rangedPlaylist = Data(playlist.prefix(4096))
+
+        URLProtocolStub.handler = { request in
+            let response = HTTPURLResponse(
+                url: try XCTUnwrap(request.url),
+                statusCode: request.httpMethod == "HEAD" ? 405 : 206,
+                httpVersion: nil,
+                headerFields: request.httpMethod == "HEAD" ? nil : [
+                    "Content-Type": "text/plain",
+                    "Content-Range": "bytes 0-4095/\(playlist.count)",
+                ]
+            )!
+            if request.httpMethod == "GET" {
+                XCTAssertEqual(request.value(forHTTPHeaderField: "Range"), "bytes=0-4095")
+            }
+            return (response, request.httpMethod == "HEAD" ? Data() : rangedPlaylist)
+        }
+
+        let item = WebMediaInfo(
+            name: "Extensionless HLS",
+            src: "https://cdn.example.com/live",
+            pageSrc: "https://example.com/watch/1",
+            pageTitle: "Live stream",
+            mimeType: "",
+            duration: 10,
+            detected: true,
+            tagId: "hls-boundary",
+            isInvisible: false
+        )
+
+        let resolved = try await WebMediaStreamer(urlSession: makeSession()).resolveMedia(item)
+        XCTAssertEqual(resolved.mimeType, "application/vnd.apple.mpegurl")
+        XCTAssertEqual(resolved.containerKind, .hls)
+    }
+
+    func testMediaStreamerRejectsIncompleteUTF8InShortTextResponse() async {
+        var truncatedPlaylist = Data("#EXTM3U\n".utf8)
+        truncatedPlaylist.append(contentsOf: [0xE7])
+        XCTAssertLessThan(truncatedPlaylist.count, 4096)
+        XCTAssertNil(String(data: truncatedPlaylist, encoding: .utf8))
+
+        URLProtocolStub.handler = { request in
+            let response = HTTPURLResponse(
+                url: try XCTUnwrap(request.url),
+                statusCode: request.httpMethod == "HEAD" ? 405 : 206,
+                httpVersion: nil,
+                headerFields: request.httpMethod == "HEAD" ? nil : [
+                    "Content-Type": "text/plain",
+                    "Content-Range": "bytes 0-\(truncatedPlaylist.count - 1)/\(truncatedPlaylist.count)",
+                ]
+            )!
+            if request.httpMethod == "GET" {
+                XCTAssertEqual(request.value(forHTTPHeaderField: "Range"), "bytes=0-4095")
+            }
+            return (response, request.httpMethod == "HEAD" ? Data() : truncatedPlaylist)
+        }
+
+        let item = WebMediaInfo(
+            name: "Truncated extensionless response",
+            src: "https://cdn.example.com/live",
+            pageSrc: "https://example.com/watch/1",
+            pageTitle: "Live stream",
+            mimeType: "",
+            duration: 10,
+            detected: true,
+            tagId: "hls-short-truncated-utf8",
+            isInvisible: false
+        )
+        let streamer = WebMediaStreamer(urlSession: makeSession())
+
+        await XCTAssertThrowsErrorAsync(try await streamer.resolveMedia(item)) { error in
+            XCTAssertEqual(error as? WebMediaStreamer.PlaybackError, .couldNotDeterminePlayableMedia)
+        }
+    }
+
     func testMediaStreamerFallsBackWhenPrimaryURLIsBlob() async throws {
         var fallbackItem = WebMediaInfo(
             name: "Fallback",
